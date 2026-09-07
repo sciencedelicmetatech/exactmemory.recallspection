@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exactmemory-recallspection"
+version = "1.0.0"
+description = "Tamper-evident key-value store with HMAC-SHA3-256 checksums"
+readme = "README.md"
+authors = [
+    {name = "Eliam Raell", email = "eliamraell@yandex.com"}
+]
+license = {text = "MIT"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Security :: Cryptography",
+]
+requires-python = ">=3.8"
+dependencies = []  # zero external dependencies
+
+[project.urls]
+Homepage = "https://github.com/sciencedelicmetatech/exactmemory.recallspection"
+Repository = "https://github.com/sciencedelicmetatech/exactmemory.recallspection"
