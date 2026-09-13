@@ -1,29 +1,23 @@
 """
-ExactMemory core.
+ExactMemory core — v1.2.0
 
 Security model
 --------------
-Each record is stored as:
-
+Per-record blob:
     [key_id (2B)] [version (8B)] [timestamp (8B)] [nonce (16B)] [payload] [HMAC (16B)]
+    HMAC-SHA256 over (key_digest || header || nonce || payload), truncated to 16B.
 
-where:
-- key_id     : uint16, identifies which key from the keyring signed the record
-- version    : uint64, monotonically increasing per key digest
-- timestamp  : float64 epoch seconds, used for freshness/TTL
-- nonce      : 16 random bytes, unique per write
-- payload    : zlib-compressed JSON
-- HMAC       : HMAC-SHA256 over (key_digest || header || nonce || payload), truncated to 16 bytes
+Container (on disk, save/load):
+    { "container": <base64 canonical-JSON>, "mac": <base64 HMAC-SHA256> }
+    Container MAC covers: format, version, counter, current_key_id, hash_name,
+    ttl_seconds, clock_skew_seconds, key_ids (list of valid IDs), max_version,
+    entries. Keys are NEVER written to disk.
 
-Properties:
-- Tamper-evident: any bit flip in any field fails HMAC verification.
-- Replay-resistant: monotonic version + timestamp + optional TTL reject
-  previously-valid records.
-- Key-rotatable: multiple keys in a keyring, each record carries its key_id.
-- Metadata-bound: HMAC covers key_id, version, timestamp, and nonce, not
-  just the payload.
-- Substitution-resistant: HMAC binds the record to the SHA3-256 key digest,
-  so a blob from one key cannot be replayed into another key's slot.
+Deletion:
+    A tombstone is written as a normal signed record with payload
+    {"__tombstone__": True}. get() on a tombstone raises KeyNotFoundError
+    (or returns None if raise_on_missing=False), but the record remains
+    versioned so replay of the pre-delete value is caught.
 """
 
 import base64
@@ -38,55 +32,26 @@ import zlib
 from typing import Any, Dict, Optional, Tuple
 
 
-# ---------- Exceptions ----------
-
-class IntegrityError(ValueError):
-    """Base class for all integrity failures."""
-
-
-class TamperDetectedError(IntegrityError):
-    """HMAC verification failed."""
+class IntegrityError(ValueError): pass
+class TamperDetectedError(IntegrityError): pass
+class ReplayDetectedError(IntegrityError): pass
+class ExpiredRecordError(IntegrityError): pass
+class UnknownKeyIdError(IntegrityError): pass
+class KeyNotFoundError(KeyError): pass
 
 
-class ReplayDetectedError(IntegrityError):
-    """Record version is older than the highest seen for this key."""
-
-
-class ExpiredRecordError(IntegrityError):
-    """Record timestamp is outside the TTL window."""
-
-
-class UnknownKeyIdError(IntegrityError):
-    """Record uses a key_id not present in the keyring."""
-
-
-class KeyNotFoundError(KeyError):
-    """Key not present in the store (only when raise_on_missing=True)."""
-
-
-# ---------- Record layout ----------
-
-HEADER_FMT = ">HQd"                          # key_id, version, timestamp
-HEADER_SIZE = struct.calcsize(HEADER_FMT)    # 18 bytes
+HEADER_FMT = ">HQd"
+HEADER_SIZE = struct.calcsize(HEADER_FMT)
 NONCE_SIZE = 16
 HMAC_SIZE = 16
+CONTAINER_MAC_SIZE = 32
+CONTAINER_DOMAIN = b"exactmemory-container-v1"
+TOMBSTONE_MARKER = "__tombstone__"
 
 
 class ExactMemory:
-    """
-    Tamper-evident, replay-resistant, key-rotatable key-value store.
-
-    Args:
-        keys: mapping of key_id (int) -> secret bytes (>= 32 bytes recommended).
-              If None, a single random key with id 1 is generated.
-        current_key_id: key_id used for new writes. Defaults to max(keys).
-        ttl_seconds: optional freshness window. None disables TTL.
-        hash_name: HMAC hash function ("sha256" recommended; "sha3_256" also OK).
-        clock_skew_seconds: tolerance for timestamps slightly in the future.
-    """
-
-    FORMAT = "exactmemory-v2"
-    VERSION = "1.1.0"
+    FORMAT = "exactmemory-v3"
+    VERSION = "1.2.0"
 
     def __init__(
         self,
@@ -109,9 +74,7 @@ class ExactMemory:
             raise ValueError(f"unsupported hash_name: {hash_name}")
 
         self._keys: Dict[int, bytes] = {k: bytes(v) for k, v in keys.items()}
-        self._current_key_id = (
-            current_key_id if current_key_id is not None else max(self._keys)
-        )
+        self._current_key_id = current_key_id if current_key_id is not None else max(self._keys)
         if self._current_key_id not in self._keys:
             raise ValueError(f"current_key_id {self._current_key_id} not in keys")
 
@@ -126,7 +89,6 @@ class ExactMemory:
     # ---------- Key management ----------
 
     def rotate_key(self, new_key: Optional[bytes] = None) -> int:
-        """Add a new key and set it as current. Returns the new key_id."""
         new_id = max(self._keys) + 1
         if new_id > 0xFFFF:
             raise ValueError("key_id space exhausted")
@@ -145,7 +107,6 @@ class ExactMemory:
     # ---------- Public API ----------
 
     def add(self, key: str, value: Any) -> None:
-        """Store a key-value pair. Overwrites any existing value."""
         digest = self._hash(key)
         self._counter += 1
         version = self._counter
@@ -156,16 +117,6 @@ class ExactMemory:
         self._max_version[digest] = version
 
     def get(self, key: str, raise_on_missing: bool = False) -> Optional[Any]:
-        """
-        Retrieve a value.
-
-        Raises:
-            TamperDetectedError   on HMAC mismatch
-            ReplayDetectedError   on version rollback
-            ExpiredRecordError    on timestamp outside TTL
-            UnknownKeyIdError     on unrecognised key_id
-            KeyNotFoundError      on missing key (only if raise_on_missing)
-        """
         digest = self._hash(key)
         blob = self._store.get(digest)
         if blob is None:
@@ -178,13 +129,9 @@ class ExactMemory:
         now = time.time()
         age = now - meta["timestamp"]
         if age < -self._clock_skew:
-            raise ExpiredRecordError(
-                f"Record for '{key}' has future timestamp (age={age:.2f}s)"
-            )
+            raise ExpiredRecordError(f"Record for '{key}' has future timestamp")
         if self._ttl is not None and age > self._ttl:
-            raise ExpiredRecordError(
-                f"Record for '{key}' expired (age={age:.2f}s > ttl={self._ttl}s)"
-            )
+            raise ExpiredRecordError(f"Record for '{key}' expired")
 
         prev = self._max_version.get(digest)
         if prev is not None and meta["version"] < prev:
@@ -193,27 +140,52 @@ class ExactMemory:
             )
         self._max_version[digest] = meta["version"]
 
+        # Tombstone handling
+        if isinstance(value, dict) and value.get(TOMBSTONE_MARKER) is True:
+            if raise_on_missing:
+                raise KeyNotFoundError(key)
+            return None
+
         return value
 
     def delete(self, key: str) -> bool:
-        """Remove a key. Returns True if it existed."""
         digest = self._hash(key)
-        if digest in self._store:
-            del self._store[digest]
-            return True
-        return False
+        if digest not in self._store:
+            return False
+        # Write a signed tombstone — never a bare del.
+        self._counter += 1
+        version = self._counter
+        timestamp = time.time()
+        nonce = secrets.token_bytes(NONCE_SIZE)
+        blob = self._pack(key, {TOMBSTONE_MARKER: True}, version, timestamp, nonce)
+        self._store[digest] = blob
+        self._max_version[digest] = version
+        return True
 
     def __contains__(self, key: str) -> bool:
-        return self._hash(key) in self._store
+        digest = self._hash(key)
+        blob = self._store.get(digest)
+        if blob is None:
+            return False
+        try:
+            value, _ = self._unpack(key, blob)
+        except IntegrityError:
+            return False
+        return not (isinstance(value, dict) and value.get(TOMBSTONE_MARKER) is True)
 
     def __len__(self) -> int:
-        return len(self._store)
+        return sum(1 for k in self._store if k in self)
 
     # ---------- Persistence ----------
 
     def save(self, path: str) -> None:
-        """Write the entire store to a JSON file."""
-        data = {
+        """
+        Persist the store to a file.
+
+        Keys are NEVER written. load() must be called on an ExactMemory
+        constructed with the same keys, or it will raise IntegrityError.
+        """
+        container = {
             "format": self.FORMAT,
             "version": self.VERSION,
             "counter": self._counter,
@@ -221,10 +193,7 @@ class ExactMemory:
             "hash_name": self._hash_name,
             "ttl_seconds": self._ttl,
             "clock_skew_seconds": self._clock_skew,
-            "keys": {
-                str(k): base64.b64encode(v).decode("ascii")
-                for k, v in self._keys.items()
-            },
+            "key_ids": sorted(self._keys.keys()),
             "max_version": {
                 base64.b64encode(k).decode("ascii"): v
                 for k, v in self._max_version.items()
@@ -234,31 +203,63 @@ class ExactMemory:
                 for k, v in self._store.items()
             },
         }
+        payload = json.dumps(container, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        mac = self._container_mac(payload)
+
         with open(path, "w") as f:
-            json.dump(data, f, separators=(",", ":"))
+            json.dump({
+                "container": base64.b64encode(payload).decode("ascii"),
+                "mac": base64.b64encode(mac).decode("ascii"),
+            }, f, separators=(",", ":"))
 
     def load(self, path: str) -> None:
-        """Load a previously saved store, replacing in-memory state."""
+        """
+        Load a store from a file.
+
+        Uses the CALLER's keys (from the constructor). Any keys present in
+        the file are ignored — keys are never read from disk. If the container
+        MAC does not verify under the caller's keys, IntegrityError is raised.
+        """
         with open(path, "r") as f:
-            data = json.load(f)
+            wrapper = json.load(f)
+        if "container" not in wrapper or "mac" not in wrapper:
+            raise IntegrityError("Unrecognised file format (expected v3 container)")
 
-        if "entries" not in data or "keys" not in data:
-            raise IntegrityError("Unrecognised file format")
+        payload = base64.b64decode(wrapper["container"])
+        mac = base64.b64decode(wrapper["mac"])
 
-        self._counter = data["counter"]
-        self._current_key_id = data["current_key_id"]
-        self._hash_name = data.get("hash_name", "sha256")
-        self._ttl = data.get("ttl_seconds")
-        self._clock_skew = data.get("clock_skew_seconds", 60.0)
-        self._keys = {
-            int(k): base64.b64decode(v) for k, v in data["keys"].items()
-        }
+        expected = self._container_mac(payload)
+        if not hmac.compare_digest(mac, expected):
+            raise IntegrityError("Container MAC verification failed")
+
+        container = json.loads(payload.decode("utf-8"))
+
+        # Caller's keys must cover every key_id referenced in the file.
+        file_key_ids = set(int(x) for x in container.get("key_ids", []))
+        caller_key_ids = set(self._keys.keys())
+        if not file_key_ids.issubset(caller_key_ids):
+            missing = file_key_ids - caller_key_ids
+            raise UnknownKeyIdError(
+                f"File references key_ids {missing} not present in caller's keyring"
+            )
+
+        # Restore state — but do NOT touch self._keys or self._current_key_id.
+        self._counter = container["counter"]
+        self._hash_name = container["hash_name"]
+        self._ttl = container["ttl_seconds"]
+        self._clock_skew = container["clock_skew_seconds"]
+        # current_key_id must be in caller's keys
+        cur = container["current_key_id"]
+        if cur not in self._keys:
+            raise UnknownKeyIdError(f"current_key_id {cur} not in caller's keyring")
+        self._current_key_id = cur
+
         self._max_version = {
-            base64.b64decode(k): v for k, v in data["max_version"].items()
+            base64.b64decode(k): v for k, v in container["max_version"].items()
         }
         self._store = {
             base64.b64decode(k): base64.b64decode(v)
-            for k, v in data["entries"].items()
+            for k, v in container["entries"].items()
         }
 
     # ---------- Internals ----------
@@ -272,9 +273,20 @@ class ExactMemory:
             raise UnknownKeyIdError(f"Unknown key_id: {key_id}")
         return hmac.new(self._keys[key_id], data, self._hash_name).digest()
 
-    def _pack(
-        self, key: str, value: Any, version: int, timestamp: float, nonce: bytes
-    ) -> bytes:
+    def _container_mac(self, payload: bytes) -> bytes:
+        """
+        Container MAC key is derived from the caller's keyring.
+
+        Derivation: HMAC(K_root, CONTAINER_DOMAIN) where K_root is the key
+        with the smallest key_id. This makes the container MAC independent of
+        rotation order and reproducible on load with the same keyring.
+        """
+        root_id = min(self._keys)
+        root_key = self._keys[root_id]
+        derived = hmac.new(root_key, CONTAINER_DOMAIN, self._hash_name).digest()
+        return hmac.new(derived, payload, self._hash_name).digest()[:CONTAINER_MAC_SIZE]
+
+    def _pack(self, key: str, value: Any, version: int, timestamp: float, nonce: bytes) -> bytes:
         key_id = self._current_key_id
         digest = self._hash(key)
         header = struct.pack(HEADER_FMT, key_id, version, timestamp)
@@ -287,32 +299,18 @@ class ExactMemory:
     def _unpack(self, key: str, blob: bytes) -> Tuple[Any, Dict[str, Any]]:
         min_size = HEADER_SIZE + NONCE_SIZE + HMAC_SIZE
         if len(blob) < min_size:
-            raise TamperDetectedError(
-                f"Record too short ({len(blob)} < {min_size})"
-            )
-
+            raise TamperDetectedError("Record too short")
         body = blob[:-HMAC_SIZE]
         mac = blob[-HMAC_SIZE:]
-
         key_id, version, timestamp = struct.unpack(HEADER_FMT, body[:HEADER_SIZE])
         digest = self._hash(key)
-
         expected = self._hmac(key_id, digest + body)[:HMAC_SIZE]
         if not hmac.compare_digest(mac, expected):
             raise TamperDetectedError("HMAC verification failed")
-
         nonce = body[HEADER_SIZE:HEADER_SIZE + NONCE_SIZE]
         payload = body[HEADER_SIZE + NONCE_SIZE:]
-
         try:
-            json_bytes = zlib.decompress(payload)
-            value = json.loads(json_bytes.decode("utf-8"))
+            value = json.loads(zlib.decompress(payload).decode("utf-8"))
         except (zlib.error, json.JSONDecodeError, UnicodeDecodeError) as e:
             raise TamperDetectedError(f"Payload decode failed: {e}")
-
-        return value, {
-            "key_id": key_id,
-            "version": version,
-            "timestamp": timestamp,
-            "nonce": nonce,
-        }
+        return value, {"key_id": key_id, "version": version, "timestamp": timestamp, "nonce": nonce}
