@@ -1,0 +1,12 @@
+============================================================================================================
+PERSISTENCE-LAYER ATTACK BENCHMARK
+============================================================================================================
+Scope: attacks on the save()/load() file, not in-memory state.
+------------------------------------------------------------------------------------------------------------
+  ✅ DETECTED      F1 container rollback     IntegrityError: IntegrityError
+  ✅ DETECTED      F2 semantic rewrite       container MAC rejected (IntegrityError: IntegrityError)
+  ✅ DETECTED      F3 key substitution       IntegrityError: IntegrityError
+------------------------------------------------------------------------------------------------------------
+
+  Passed: 3/3
+✅ Results written to: /home/24wzq8z6/benchmark_persistence_results.json
