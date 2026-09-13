@@ -4,22 +4,38 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "exactmemory-recallspection"
-version = "1.1.0"
-description = "Tamper-evident key-value store with HMAC-SHA3-256 checksums"
+version = "2.1.0"
+description = "Tamper-evident key-value store with HMAC-SHA256 integrity, replay resistance, key rotation, and transparency log. Zero dependencies pure Python stdlib."
 readme = "README.md"
-authors = [
-    {name = "Eliam Raell", email = "eliamraell@yandex.com"}
-]
-license = {text = "MIT"}
+license = { text = "AGPL-3.0" }
+authors = [{ name = "Sciencedelic Metatech", email = "eliamraell@yandex.com" }]
+keywords = ["tamper-evident", "hmac", "audit", "exact-memory", "recallspection", "cryptographic", "key-value"]
 classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Security :: Cryptography",
+    "Topic :: Database",
+    "Operating System :: OS Independent",
 ]
 requires-python = ">=3.8"
-dependencies = []  # zero external dependencies
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/sciencedelicmetatech/exactmemory.recallspection"
 Repository = "https://github.com/sciencedelicmetatech/exactmemory.recallspection"
+Issues = "https://github.com/sciencedelicmetatech/exactmemory.recallspection/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["exactmemory*"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py", "main*.py"]
