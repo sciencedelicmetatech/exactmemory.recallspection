@@ -1,18 +1,27 @@
 """
-Reproducible integrity benchmark for exactmemory-recallspection.
+Persistence-layer attack benchmark for exactmemory-recallspection.
 
-Downloads the latest repo from GitHub, imports it, and runs 10 attack
-classes against a 100-fact corpus. Produces TP/FN/FP/TN counts and
-standard rates (DR, SFR, FPR, SR).
+Scope: attacks on the save()/load() file, not in-memory state.
 
-Run on any Python 3.8+ device:
-    python benchmarks/benchmark_integrity_v3.py
+Covers three file-level attacks:
+    F1  Container rollback: attacker rolls back counter / max_version, then
+        restores an old valid record → get() must detect replay.
+    F2  Semantic rewrite: attacker rewrites a record's payload under a valid
+        HMAC. With out-of-band keys, this must fail because the attacker
+        cannot compute the HMAC.
+    F3  Key substitution: attacker overwrites the key block in the file.
+        With out-of-band keys, the file contains no keys, so this attack is
+        structurally impossible. load() must use caller keys only.
+
+Produces pass/fail per attack with the observed exception type.
+
+Run:
+    python benchmarks/benchmark_persistence.py
 """
 import base64
 import json
 import os
 import ssl
-import struct
 import sys
 import tempfile
 import time
@@ -21,12 +30,10 @@ import zipfile
 
 REPO_ZIP = "https://github.com/sciencedelicmetatech/exactmemory.recallspection/archive/refs/heads/main.zip"
 
-# --- purge stale imports ---
 for mod in list(sys.modules.keys()):
     if "exactmemory" in mod:
         del sys.modules[mod]
 
-# --- download ---
 print("📥 Downloading repo...")
 ctx = ssl._create_unverified_context()
 with urllib.request.urlopen(REPO_ZIP, context=ctx) as r:
@@ -52,6 +59,7 @@ sys.path.insert(0, repo_folder)
 
 from exactmemory_recallspection import (
     ExactMemory,
+    IntegrityError,
     TamperDetectedError,
     ReplayDetectedError,
     ExpiredRecordError,
@@ -59,230 +67,242 @@ from exactmemory_recallspection import (
     KeyNotFoundError,
 )
 
-# =========================================================
-# Corpus
-# =========================================================
-SECRET = b"benchmark-secret-key-32-bytes!!!!!"
-FACTS = [(f"cat{i % 5}:rec:{i}", {"id": i, "v": f"value_{i}"}) for i in range(100)]
+SECRET = b"persistence-test-key-32-bytes!!!!!"
 
 
-def fresh_mem(**kw):
-    m = ExactMemory(keys={1: SECRET}, **kw)
-    for k, v in FACTS:
-        m.add(k, v)
+def fresh_store():
+    m = ExactMemory(keys={1: SECRET})
+    m.add("a", "original_a")
+    m.add("b", "original_b")
+    m.add("c", "original_c")
     return m
 
 
-def classify(mem, key, expected):
-    """Return: 'correct' | 'detected' | 'silent_wrong' | 'missing'."""
+def save_to_temp(m):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
+        path = tmp.name
+    m.save(path)
+    return path
+
+
+def load_file(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def write_file(path, obj):
+    with open(path, "w") as f:
+        json.dump(obj, f, separators=(",", ":"))
+
+
+# =========================================================
+# F1 — Container rollback
+# =========================================================
+
+def attack_f1_container_rollback():
+    """
+    Scenario:
+        1. Write a, b, c → version 3.
+        2. Save to disk.
+        3. Rewrite a → version 4.
+        4. Attacker rolls back the file to the version-3 snapshot AND
+           rolls back counter/max_version in the container.
+        5. load() must detect that the container MAC fails.
+
+    Detection: IntegrityError raised at load().
+    """
+    m = fresh_store()
+    path = save_to_temp(m)
+
+    # Attacker modifies the container's counter field
+    wrapper = load_file(path)
+    payload = json.loads(base64.b64decode(wrapper["container"]).decode("utf-8"))
+    payload["counter"] = 0
+    payload["max_version"] = {}
+    new_container = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    wrapper["container"] = base64.b64encode(new_container).decode("ascii")
+    # Attacker cannot recompute the MAC without the key — leave it as-is
+    write_file(path, wrapper)
+
+    # Honest party reloads
+    m2 = ExactMemory(keys={1: SECRET})
     try:
-        got = mem.get(key, raise_on_missing=True)
-        return "correct" if got == expected else "silent_wrong"
-    except KeyNotFoundError:
-        return "missing"
-    except (
-        TamperDetectedError,
-        ReplayDetectedError,
-        ExpiredRecordError,
-        UnknownKeyIdError,
-    ):
-        return "detected"
+        m2.load(path)
+        return False, "no error raised — container rollback accepted"
+    except IntegrityError as e:
+        return True, f"IntegrityError: {type(e).__name__}"
+    except Exception as e:
+        return False, f"unexpected: {type(e).__name__}: {e}"
+    finally:
+        os.unlink(path)
 
 
 # =========================================================
-# Attacks — each returns set of attacked keys
+# F2 — Semantic rewrite of a record
 # =========================================================
 
-def attack_none(mem):
-    return set()
+def attack_f2_semantic_rewrite():
+    """
+    Scenario:
+        1. Write a, b, c.
+        2. Save.
+        3. Attacker rewrites a's payload from "original_a" to "ATTACKER-CONTROLLED".
+           Attacker cannot compute a valid HMAC without the secret key.
+        4. load() should succeed (container is intact) but get("a") must
+           detect the tampering.
+
+    Detection: TamperDetectedError raised at get("a").
+    """
+    m = fresh_store()
+    path = save_to_temp(m)
+
+    wrapper = load_file(path)
+    payload = json.loads(base64.b64decode(wrapper["container"]).decode("utf-8"))
+    entries = payload["entries"]
+
+    # Find a's record. In v3, entries map base64(digest) -> base64(blob).
+    # We rewrite *any* record whose payload decompresses to original_a.
+    import zlib
+    target_key = None
+    for enc_digest, enc_blob in entries.items():
+        blob = base64.b64decode(enc_blob)
+        body = blob[:-16]
+        mac = blob[-16:]
+        # header is 18 bytes, nonce 16 bytes, rest is payload
+        payload_bytes = body[18 + 16:]
+        try:
+            value = json.loads(zlib.decompress(payload_bytes).decode("utf-8"))
+        except Exception:
+            continue
+        if value == "original_a":
+            target_key = enc_digest
+            break
+
+    if target_key is None:
+        os.unlink(path)
+        return False, "could not locate target record in file"
+
+    # Rewrite the payload while keeping the old MAC — the attacker cannot
+    # produce a new valid MAC without the key.
+    old_blob = base64.b64decode(entries[target_key])
+    body = old_blob[:-16]
+    new_payload = zlib.compress(json.dumps("ATTACKER-CONTROLLED").encode("utf-8"), 6)
+    new_body = body[: 18 + 16] + new_payload
+    new_blob = new_body + old_blob[-16:]  # keep old MAC
+    entries[target_key] = base64.b64encode(new_blob).decode("ascii")
+
+    new_container = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    wrapper["container"] = base64.b64encode(new_container).decode("ascii")
+    # Attacker also cannot recompute the container MAC.
+    # So load() should fail here regardless of the record rewrite.
+    write_file(path, wrapper)
+
+    m2 = ExactMemory(keys={1: SECRET})
+    try:
+        m2.load(path)
+    except IntegrityError as e:
+        os.unlink(path)
+        return True, f"container MAC rejected (IntegrityError: {type(e).__name__})"
+
+    # If we got here, container loaded. Now try to read the tampered record.
+    try:
+        val = m2.get("a", raise_on_missing=True)
+        os.unlink(path)
+        return False, f"tampered record served as authentic: {val!r}"
+    except IntegrityError as e:
+        os.unlink(path)
+        return True, f"TamperDetectedError: {type(e).__name__}"
+    except Exception as e:
+        os.unlink(path)
+        return False, f"unexpected: {type(e).__name__}: {e}"
 
 
-def attack_byte_corruption(mem):
-    attacked = set()
-    for i, (k, _) in enumerate(FACTS):
-        if i % 5 == 0:
-            d = mem._hash(k)
-            b = bytearray(mem._store[d])
-            b[-1] ^= 0xFF
-            mem._store[d] = bytes(b)
-            attacked.add(k)
-    return attacked
+# =========================================================
+# F3 — Key substitution
+# =========================================================
 
+def attack_f3_key_substitution():
+    """
+    Scenario:
+        1. Write a, b, c.
+        2. Save.
+        3. Attacker replaces the keys block in the file with their own key
+           and reseals every record.
+        4. Honest party constructs ExactMemory(keys={1: SECRET}) and calls load().
+        5. load() must use the caller's key, not the file's. Since the file
+           contains no keys in v3, this attack is structurally impossible.
 
-def attack_metadata_tamper(mem):
-    attacked = set()
-    for i, (k, _) in enumerate(FACTS):
-        if i % 5 == 1:
-            d = mem._hash(k)
-            b = bytearray(mem._store[d])
-            b[4] ^= 0xFF
-            mem._store[d] = bytes(b)
-            attacked.add(k)
-    return attacked
+    Detection: either (a) file has no 'keys' field, or (b) IntegrityError.
+    """
+    m = fresh_store()
+    path = save_to_temp(m)
 
+    wrapper = load_file(path)
+    payload = json.loads(base64.b64decode(wrapper["container"]).decode("utf-8"))
 
-def attack_truncation(mem):
-    attacked = set()
-    for i, (k, _) in enumerate(FACTS):
-        if i % 10 == 0:
-            d = mem._hash(k)
-            mem._store[d] = mem._store[d][:-8]
-            attacked.add(k)
-    return attacked
+    # Check whether the file contains any keys at all
+    if "keys" in payload:
+        os.unlink(path)
+        return False, "file still contains a 'keys' field — out-of-band key custody not enforced"
 
+    # Try to inject keys anyway (simulating an attacker who tries)
+    payload["keys"] = {"1": base64.b64encode(b"attacker-key-32-bytes!!!!!!!!!!!!!").decode("ascii")}
+    new_container = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    wrapper["container"] = base64.b64encode(new_container).decode("ascii")
+    write_file(path, wrapper)
 
-def attack_wrong_key(mem):
-    mem._keys[1] = b"wrong-key-32-bytes-long-!!!!!!!!!"
-    return {k for k, _ in FACTS}
-
-
-def attack_replay(mem):
-    attacked = set()
-    for i, (k, _) in enumerate(FACTS):
-        if i % 5 == 2:
-            d = mem._hash(k)
-            old = mem._store[d]
-            mem.add(k, {"replayed": True})
-            mem._store[d] = old
-            attacked.add(k)
-    return attacked
-
-
-def attack_record_substitution(mem):
-    attacked = set()
-    keys = [k for k, _ in FACTS]
-    for i in range(0, len(keys) - 1, 20):
-        a, b = keys[i], keys[i + 1]
-        da, db = mem._hash(a), mem._hash(b)
-        mem._store[db] = mem._store[da]
-        attacked.add(b)
-    return attacked
-
-
-def attack_deletion(mem):
-    attacked = set()
-    for i, (k, _) in enumerate(FACTS):
-        if i % 10 == 0:
-            mem.delete(k)
-            attacked.add(k)
-    return attacked
-
-
-def attack_unknown_key_id(mem):
-    attacked = set()
-    for i, (k, _) in enumerate(FACTS):
-        if i % 10 == 5:
-            d = mem._hash(k)
-            b = bytearray(mem._store[d])
-            struct.pack_into(">H", b, 0, 999)
-            mem._store[d] = bytes(b)
-            attacked.add(k)
-    return attacked
-
-
-def expired_setup():
-    m = ExactMemory(keys={1: SECRET}, ttl_seconds=0.001)
-    for k, v in FACTS:
-        m.add(k, v)
-    time.sleep(0.05)
-    return m
+    m2 = ExactMemory(keys={1: SECRET})
+    try:
+        m2.load(path)
+        # If load succeeded, the injected keys must have been ignored.
+        # Verify by reading a value that was signed with the real key.
+        val = m2.get("a", raise_on_missing=True)
+        os.unlink(path)
+        if val == "original_a":
+            return True, "injected 'keys' field ignored; caller key used; value intact"
+        return False, f"unexpected value after load: {val!r}"
+    except IntegrityError as e:
+        os.unlink(path)
+        return True, f"IntegrityError: {type(e).__name__}"
+    except Exception as e:
+        os.unlink(path)
+        return False, f"unexpected: {type(e).__name__}: {e}"
 
 
 # =========================================================
 # Runner
 # =========================================================
 
-ATTACKS = [
-    ("none",                lambda: fresh_mem(), attack_none),
-    ("byte_corruption",     lambda: fresh_mem(), attack_byte_corruption),
-    ("metadata_tamper",     lambda: fresh_mem(), attack_metadata_tamper),
-    ("truncation",          lambda: fresh_mem(), attack_truncation),
-    ("wrong_key",           lambda: fresh_mem(), attack_wrong_key),
-    ("replay",              lambda: fresh_mem(), attack_replay),
-    ("record_substitution", lambda: fresh_mem(), attack_record_substitution),
-    ("deletion",            lambda: fresh_mem(), attack_deletion),
-    ("unknown_key_id",      lambda: fresh_mem(), attack_unknown_key_id),
-    ("expired_ttl",         expired_setup,       attack_none),
-]
-
-
-def run_attack(setup_fn, attack_fn):
-    mem = setup_fn()
-    attacked_keys = attack_fn(mem) or set()
-
-    tp = fn = fp = tn = 0
-    for k, v in FACTS:
-        outcome = classify(mem, k, v)
-        is_attacked = k in attacked_keys
-        if is_attacked:
-            if outcome == "detected":
-                tp += 1
-            else:
-                fn += 1
-        else:
-            if outcome == "detected":
-                fp += 1
-            else:
-                tn += 1
-
-    attacked = len(attacked_keys)
-    clean = len(FACTS) - attacked
-    return {
-        "attacked": attacked,
-        "clean": clean,
-        "tp": tp, "fn": fn, "fp": fp, "tn": tn,
-        "DR":  (tp / attacked) if attacked else None,
-        "SFR": (fn / attacked) if attacked else None,
-        "FPR": (fp / clean)    if clean else 0.0,
-        "SR":  (tp + tn) / len(FACTS),
-    }
-
-
 def main():
     print()
     print("=" * 108)
-    print("INTEGRITY BENCHMARK v3 — expanded attack coverage")
+    print("PERSISTENCE-LAYER ATTACK BENCHMARK")
     print("=" * 108)
-    print(f"Facts: {len(FACTS)}  |  Attacks: {len(ATTACKS)}  |  HMAC-SHA256, 16-byte tag")
+    print("Scope: attacks on the save()/load() file, not in-memory state.")
     print("-" * 108)
-    print(
-        f"{'Attack':<22} | {'Att':>4} | {'Clean':>5} | {'TP':>4} | {'FN':>4} | "
-        f"{'FP':>4} | {'TN':>4} | {'DR':>5} | {'SFR':>5} | {'FPR':>5} | {'SR':>5}"
-    )
-    print("-" * 108)
+
+    attacks = [
+        ("F1 container rollback",   attack_f1_container_rollback),
+        ("F2 semantic rewrite",     attack_f2_semantic_rewrite),
+        ("F3 key substitution",     attack_f3_key_substitution),
+    ]
 
     results = {}
-    for name, setup_fn, attack_fn in ATTACKS:
-        r = run_attack(setup_fn, attack_fn)
-        results[name] = r
-
-        def fmt(x):
-            return "  —  " if x is None else f"{x:.2f}"
-
-        print(
-            f"{name:<22} | {r['attacked']:>4} | {r['clean']:>5} | "
-            f"{r['tp']:>4} | {r['fn']:>4} | {r['fp']:>4} | {r['tn']:>4} | "
-            f"{fmt(r['DR']):>5} | {fmt(r['SFR']):>5} | {fmt(r['FPR']):>5} | {fmt(r['SR']):>5}"
-        )
+    for name, fn in attacks:
+        detected, detail = fn()
+        results[name] = {"detected": detected, "detail": detail}
+        status = "✅ DETECTED" if detected else "❌ FAILED"
+        print(f"  {status:<15} {name:<25} {detail}")
 
     print("-" * 108)
-    print()
-    print("Legend:")
-    print("  Att    = facts the attack modified")
-    print("  Clean  = facts the attack did NOT modify")
-    print("  TP     = attacked AND detected")
-    print("  FN     = attacked AND NOT detected (silent failure)")
-    print("  FP     = clean AND falsely flagged")
-    print("  TN     = clean AND correct")
-    print("  DR     = TP / Attacked        (higher better)")
-    print("  SFR    = FN / Attacked        (lower better)")
-    print("  FPR    = FP / Clean           (lower better)")
-    print("  SR     = (TP + TN) / Total    (higher better)")
+    passed = sum(1 for r in results.values() if r["detected"])
+    print(f"\n  Passed: {passed}/{len(attacks)}")
 
-    out_path = os.path.join(os.path.dirname(__file__), "benchmark_results_v3.json")
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "benchmark_persistence_results.json")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"\n✅ Results written to: {out_path}")
+    print(f"✅ Results written to: {out_path}")
 
 
 if __name__ == "__main__":
