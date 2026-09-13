@@ -1,316 +1,269 @@
-"""
-ExactMemory core — v1.2.0
+# ExactMemory v3.0.0 - Final Release
+# BREAKING from v2.x: 32-byte tags, explicit container_key_id, require_log, remote_anchor
+# Zero dependencies, pure Python stdlib
 
-Security model
---------------
-Per-record blob:
-    [key_id (2B)] [version (8B)] [timestamp (8B)] [nonce (16B)] [payload] [HMAC (16B)]
-    HMAC-SHA256 over (key_digest || header || nonce || payload), truncated to 16B.
-
-Container (on disk, save/load):
-    { "container": <base64 canonical-JSON>, "mac": <base64 HMAC-SHA256> }
-    Container MAC covers: format, version, counter, current_key_id, hash_name,
-    ttl_seconds, clock_skew_seconds, key_ids (list of valid IDs), max_version,
-    entries. Keys are NEVER written to disk.
-
-Deletion:
-    A tombstone is written as a normal signed record with payload
-    {"__tombstone__": True}. get() on a tombstone raises KeyNotFoundError
-    (or returns None if raise_on_missing=False), but the record remains
-    versioned so replay of the pre-delete value is caught.
-"""
-
-import base64
-import hashlib
-import hmac
-import json
 import os
-import secrets
-import struct
+import hmac
+import hashlib
+import json
 import time
 import zlib
-from typing import Any, Dict, Optional, Tuple
+import tempfile
+from typing import Dict, Optional, Tuple
 
+try:
+    import fcntl
+    HAS_FCNTL = True
+except ImportError:
+    HAS_FCNTL = False
 
-class IntegrityError(ValueError): pass
-class TamperDetectedError(IntegrityError): pass
-class ReplayDetectedError(IntegrityError): pass
-class ExpiredRecordError(IntegrityError): pass
-class UnknownKeyIdError(IntegrityError): pass
-class KeyNotFoundError(KeyError): pass
+def sha3_256_hex(data: bytes) -> str:
+    return hashlib.sha3_256(data).hexdigest()
 
+class ExactMemoryError(Exception): pass
+class TamperError(ExactMemoryError): pass
+class RollbackError(ExactMemoryError): pass
+class LogCompromisedError(ExactMemoryError): pass
+class MissingKeyError(ExactMemoryError): pass
 
-HEADER_FMT = ">HQd"
-HEADER_SIZE = struct.calcsize(HEADER_FMT)
-NONCE_SIZE = 16
-HMAC_SIZE = 16
-CONTAINER_MAC_SIZE = 32
-CONTAINER_DOMAIN = b"exactmemory-container-v1"
-TOMBSTONE_MARKER = "__tombstone__"
+class RemoteAnchor:
+    def anchor(self, chain_hash: str, max_version: int, container_hash: str): raise NotImplementedError
+    def get_latest(self) -> Optional[dict]: raise NotImplementedError
+    def verify(self, chain_hash: str) -> bool: raise NotImplementedError
 
+class TransparencyLog:
+    def __init__(self, log_path: str, require_log: bool = True):
+        self.log_path = log_path
+        self.require_log = require_log
+    def _canonical(self, obj) -> bytes:
+        return json.dumps(obj, sort_keys=True, separators=(',', ':')).encode()
+    def append(self, counter: int, max_version: int, container_hash: str) -> dict:
+        prev_hash = "0"*64
+        last = self._last_entry()
+        if last:
+            prev_hash = last['chain_hash']
+        entry = {'timestamp': int(time.time()), 'counter': counter, 'max_version': max_version, 'container_hash': container_hash, 'prev_hash': prev_hash}
+        chain_hash = sha3_256_hex((prev_hash + self._canonical(entry).decode()).encode())
+        entry['chain_hash'] = chain_hash
+        with open(self.log_path, 'a') as f:
+            if HAS_FCNTL:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            f.write(self._canonical(entry).decode() + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+            if HAS_FCNTL:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        return entry
+    def _last_entry(self):
+        if not os.path.exists(self.log_path):
+            return None
+        try:
+            with open(self.log_path, 'r') as f:
+                lines = [l.strip() for l in f if l.strip()]
+                return json.loads(lines[-1]) if lines else None
+        except:
+            return None
+    def verify_chain(self):
+        if not os.path.exists(self.log_path):
+            if self.require_log:
+                return False, "Log file missing but require_log=True - possible deletion attack"
+            return True, "No log yet (opt-in)"
+        with open(self.log_path, 'r') as f:
+            lines = [l.strip() for l in f if l.strip()]
+        prev_hash = "0"*64
+        for i, line in enumerate(lines):
+            entry = json.loads(line)
+            if entry.get('prev_hash') != prev_hash:
+                return False, f"Line {i} prev_hash mismatch"
+            entry_copy = {k: v for k, v in entry.items() if k != 'chain_hash'}
+            recomputed = sha3_256_hex((prev_hash + self._canonical(entry_copy).decode()).encode())
+            if not hmac.compare_digest(recomputed, entry['chain_hash']):
+                return False, f"Line {i} chain_hash invalid"
+            prev_hash = entry['chain_hash']
+        return True, f"Chain OK - {len(lines)} entries"
+    def get_tip(self):
+        return self._last_entry()
 
 class ExactMemory:
-    FORMAT = "exactmemory-v3"
-    VERSION = "1.2.0"
+    VERSION = "3.0.0"
+    def __init__(self, keys: Dict[str, bytes], container_key_id: str = 'container', ttl_seconds: Optional[int]=None, log_path: str="./transparency.log", remote_anchor: Optional[RemoteAnchor]=None, require_log: bool=True, strict_rollback: bool=True):
+        if container_key_id not in keys:
+            raise ValueError(f"container_key_id '{container_key_id}' must exist in keys - which key signs? Explicitly required (v3.0.0 breaking change)")
+        self.keys = keys
+        self.container_key_id = container_key_id
+        self.ttl = ttl_seconds
+        self.store = {}
+        self.counter = 0
+        self.max_version = 0
+        self.per_key_max = {}
+        self.tombstones = {}
+        self.log = TransparencyLog(log_path, require_log=require_log)
+        self.remote_anchor = remote_anchor
+        self.require_log = require_log
+        self.strict_rollback = strict_rollback
+        self.tag_len = 32
 
-    def __init__(
-        self,
-        keys: Optional[Dict[int, bytes]] = None,
-        current_key_id: Optional[int] = None,
-        ttl_seconds: Optional[float] = None,
-        hash_name: str = "sha256",
-        clock_skew_seconds: float = 60.0,
-    ):
-        if keys is None:
-            keys = {1: secrets.token_bytes(32)}
-        if not keys:
-            raise ValueError("keys must not be empty")
-        for kid, k in keys.items():
-            if not isinstance(kid, int) or kid < 0 or kid > 0xFFFF:
-                raise ValueError(f"key_id {kid} must be in [0, 65535]")
-            if not isinstance(k, (bytes, bytearray)) or len(k) < 16:
-                raise ValueError(f"key {kid} must be bytes >= 16 bytes")
-        if hash_name not in ("sha256", "sha3_256", "sha512", "sha3_512"):
-            raise ValueError(f"unsupported hash_name: {hash_name}")
+    def _canonical(self, record: dict) -> bytes:
+        return json.dumps(record, sort_keys=True, separators=(',', ':')).encode()
+    def _make_tag(self, key_id: str, record: dict) -> bytes:
+        rec = record.copy()
+        rec['_key_hash'] = sha3_256_hex(rec['key'].encode())
+        rec['_key_id_hash'] = sha3_256_hex(key_id.encode())
+        return hmac.new(self.keys[key_id], self._canonical(rec), hashlib.sha256).digest()[:32]
 
-        self._keys: Dict[int, bytes] = {k: bytes(v) for k, v in keys.items()}
-        self._current_key_id = current_key_id if current_key_id is not None else max(self._keys)
-        if self._current_key_id not in self._keys:
-            raise ValueError(f"current_key_id {self._current_key_id} not in keys")
+    def put(self, k, v, key_id=None):
+        kid = key_id or next(iter([kk for kk in self.keys if kk != self.container_key_id]))
+        self.counter += 1
+        record = {'key': k, 'value': v, 'key_id': kid, 'version': self.counter, 'timestamp': int(time.time()), 'nonce': os.urandom(16).hex()}
+        tag = self._make_tag(kid, record)
+        self.store[k] = (record, tag)
+        self.max_version = self.counter
+        self.per_key_max[k] = self.counter
+        self.tombstones.pop(k, None)
+        return record
 
-        self._ttl = ttl_seconds
-        self._hash_name = hash_name
-        self._clock_skew = clock_skew_seconds
+    def get_with_status(self, k) -> Tuple[Optional[object], str]:
+        if k in self.tombstones:
+            rec, tag = self.tombstones[k]
+            if not hmac.compare_digest(tag, self._make_tag(rec['key_id'], rec)):
+                return None, "tampered"
+            return None, "tombstoned"
+        if k not in self.store:
+            return None, "missing"
+        rec, tag = self.store[k]
+        if not hmac.compare_digest(tag, self._make_tag(rec['key_id'], rec)):
+            return None, "tampered"
+        if rec['version'] < self.per_key_max.get(k, 0):
+            return None, "tampered"
+        if self.ttl is not None and int(time.time()) - rec['timestamp'] > self.ttl:
+            return None, "expired"
+        return rec['value'], "ok"
 
-        self._store: Dict[bytes, bytes] = {}
-        self._max_version: Dict[bytes, int] = {}
-        self._counter: int = 0
+    def get(self, k, raise_on_missing=False, raise_on_tampered=False, raise_on_expired=False):
+        value, status = self.get_with_status(k)
+        if status == "ok":
+            return value
+        if status == "missing" and raise_on_missing:
+            raise MissingKeyError(f"Key '{k}' not found")
+        if status in ("tampered", "tombstoned") and raise_on_tampered:
+            raise TamperError(f"Key '{k}' {status}")
+        if status == "expired" and raise_on_expired:
+            raise TamperError(f"Key '{k}' expired")
+        return None
 
-    # ---------- Key management ----------
+    def delete(self, k, key_id=None):
+        kid = key_id or next(iter([kk for kk in self.keys if kk != self.container_key_id]))
+        self.counter += 1
+        tomb = {'key': k, 'deleted': True, 'version': self.counter, 'key_id': kid, 'timestamp': int(time.time()), 'nonce': os.urandom(16).hex()}
+        tag = self._make_tag(kid, tomb)
+        self.tombstones[k] = (tomb, tag)
+        self.store.pop(k, None)
+        self.max_version = self.counter
+        self.per_key_max[k] = self.counter
 
-    def rotate_key(self, new_key: Optional[bytes] = None) -> int:
-        new_id = max(self._keys) + 1
-        if new_id > 0xFFFF:
-            raise ValueError("key_id space exhausted")
-        self._keys[new_id] = new_key or secrets.token_bytes(32)
-        self._current_key_id = new_id
-        return new_id
+    def save(self, path: str):
+        entries = [(key, rec, tag.hex()) for key, (rec, tag) in self.store.items()]
+        tombs = [(key, rec, tag.hex()) for key, (rec, tag) in self.tombstones.items()]
+        container = {'counter': self.counter, 'max_version': self.max_version, 'per_key_max': self.per_key_max, 'entries': entries, 'tombstones': tombs, 'tag_len': 32, 'version': self.VERSION, 'container_key_id': self.container_key_id}
+        raw = json.dumps(container, sort_keys=True, separators=(',', ':')).encode()
+        compressed = zlib.compress(raw, 6)
+        container_hash = sha3_256_hex(compressed)
+        mac = hmac.new(self.keys[self.container_key_id], compressed, hashlib.sha256).digest()
+        with open(path, 'wb') as f:
+            if HAS_FCNTL:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            f.write(mac + compressed)
+            f.flush()
+            os.fsync(f.fileno())
+            if HAS_FCNTL:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        log_entry = self.log.append(self.counter, self.max_version, container_hash)
+        if self.remote_anchor:
+            self.remote_anchor.anchor(log_entry['chain_hash'], self.max_version, container_hash)
 
-    @property
-    def current_key_id(self) -> int:
-        return self._current_key_id
+    def load(self, path: str, keys: Dict[str, bytes]):
+        valid, msg = self.log.verify_chain()
+        if not valid:
+            raise LogCompromisedError(msg)
+        tip = self.log.get_tip()
+        if self.require_log and not tip:
+            raise LogCompromisedError("Log required but missing - possible deletion attack. Set require_log=False to opt-in")
+        if self.remote_anchor and tip:
+            latest_remote = self.remote_anchor.get_latest()
+            if latest_remote and tip['max_version'] < latest_remote['max_version']:
+                raise RollbackError(f"Log rollback vs remote anchor: log {tip['max_version']} < remote {latest_remote['max_version']}")
+        with open(path, 'rb') as f:
+            if HAS_FCNTL:
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            blob = f.read()
+            if HAS_FCNTL:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        if len(blob) < 32:
+            raise TamperError("File too short")
+        mac, compressed = blob[:32], blob[32:]
+        expected_mac = hmac.new(keys[self.container_key_id], compressed, hashlib.sha256).digest()
+        if not hmac.compare_digest(mac, expected_mac):
+            raise TamperError("Container MAC failed")
+        container_hash = sha3_256_hex(compressed)
+        raw = zlib.decompress(compressed)
+        container = json.loads(raw)
+        if tip and container['max_version'] < tip['max_version']:
+            raise RollbackError(f"ROLLBACK DETECTED! File {container['max_version']} < log {tip['max_version']}")
+        self.keys = keys
+        self.counter = container['counter']
+        self.max_version = container['max_version']
+        self.per_key_max = container.get('per_key_max', {})
+        self.store = {}
+        expired = 0
+        for k, rec, tag_hex in container['entries']:
+            if self.ttl is not None and int(time.time()) - rec['timestamp'] > self.ttl:
+                expired += 1
+                continue
+            self.store[k] = (rec, bytes.fromhex(tag_hex))
+        self.tombstones = {k: (rec, bytes.fromhex(tag_hex)) for k, rec, tag_hex in container.get('tombstones', [])}
 
-    @property
-    def key_ids(self):
-        return sorted(self._keys.keys())
+def make_store(log_path="./transparency.log", require_log=True):
+    keys = {'k1': b'secret-key-32-bytes-long-12345678', 'k2': b'another-secret-key-32-bytes-8765', 'container': b'container-key-32-bytes-long-123456'}
+    return ExactMemory(keys=keys, log_path=log_path, require_log=require_log), keys
 
-    # ---------- Public API ----------
+# Tests (same as v2.1.0, now v3.0.0)
+def test_basic_put_get():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        store, _ = make_store(os.path.join(tmp, "log"))
+        store.put("user_123", {"theme": "dark"})
+        assert store.get("user_123") == {"theme": "dark"}
 
-    def add(self, key: str, value: Any) -> None:
-        digest = self._hash(key)
-        self._counter += 1
-        version = self._counter
-        timestamp = time.time()
-        nonce = secrets.token_bytes(NONCE_SIZE)
-        blob = self._pack(key, value, version, timestamp, nonce)
-        self._store[digest] = blob
-        self._max_version[digest] = version
+def test_32byte_tags():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        store, _ = make_store(os.path.join(tmp, "log"))
+        store.put("a", "data")
+        rec, tag = store.store["a"]
+        assert len(tag) == 32
 
-    def get(self, key: str, raise_on_missing: bool = False) -> Optional[Any]:
-        digest = self._hash(key)
-        blob = self._store.get(digest)
-        if blob is None:
-            if raise_on_missing:
-                raise KeyNotFoundError(key)
-            return None
-
-        value, meta = self._unpack(key, blob)
-
-        now = time.time()
-        age = now - meta["timestamp"]
-        if age < -self._clock_skew:
-            raise ExpiredRecordError(f"Record for '{key}' has future timestamp")
-        if self._ttl is not None and age > self._ttl:
-            raise ExpiredRecordError(f"Record for '{key}' expired")
-
-        prev = self._max_version.get(digest)
-        if prev is not None and meta["version"] < prev:
-            raise ReplayDetectedError(
-                f"Replay for '{key}': version {meta['version']} < {prev}"
-            )
-        self._max_version[digest] = meta["version"]
-
-        # Tombstone handling
-        if isinstance(value, dict) and value.get(TOMBSTONE_MARKER) is True:
-            if raise_on_missing:
-                raise KeyNotFoundError(key)
-            return None
-
-        return value
-
-    def delete(self, key: str) -> bool:
-        digest = self._hash(key)
-        if digest not in self._store:
-            return False
-        # Write a signed tombstone — never a bare del.
-        self._counter += 1
-        version = self._counter
-        timestamp = time.time()
-        nonce = secrets.token_bytes(NONCE_SIZE)
-        blob = self._pack(key, {TOMBSTONE_MARKER: True}, version, timestamp, nonce)
-        self._store[digest] = blob
-        self._max_version[digest] = version
-        return True
-
-    def __contains__(self, key: str) -> bool:
-        digest = self._hash(key)
-        blob = self._store.get(digest)
-        if blob is None:
-            return False
+def test_rollback_protection():
+    import tempfile, shutil
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = os.path.join(tmp, "log")
+        db_v5 = os.path.join(tmp, "db_v5")
+        db_v10 = os.path.join(tmp, "db_v10")
+        store, keys = make_store(log_path)
+        for i in range(5):
+            store.put(f"k{i}", f"v{i}")
+        store.save(db_v5)
+        shutil.copy(db_v5, db_v5+".bak")
+        for i in range(5, 10):
+            store.put(f"k{i}", f"v{i}")
+        store.save(db_v10)
+        shutil.copy(db_v5+".bak", db_v10)
+        new_store, _ = make_store(log_path)
         try:
-            value, _ = self._unpack(key, blob)
-        except IntegrityError:
-            return False
-        return not (isinstance(value, dict) and value.get(TOMBSTONE_MARKER) is True)
+            new_store.load(db_v10, keys)
+            assert False
+        except Exception as e:
+            assert "ROLLBACK" in str(e)
 
-    def __len__(self) -> int:
-        return sum(1 for k in self._store if k in self)
-
-    # ---------- Persistence ----------
-
-    def save(self, path: str) -> None:
-        """
-        Persist the store to a file.
-
-        Keys are NEVER written. load() must be called on an ExactMemory
-        constructed with the same keys, or it will raise IntegrityError.
-        """
-        container = {
-            "format": self.FORMAT,
-            "version": self.VERSION,
-            "counter": self._counter,
-            "current_key_id": self._current_key_id,
-            "hash_name": self._hash_name,
-            "ttl_seconds": self._ttl,
-            "clock_skew_seconds": self._clock_skew,
-            "key_ids": sorted(self._keys.keys()),
-            "max_version": {
-                base64.b64encode(k).decode("ascii"): v
-                for k, v in self._max_version.items()
-            },
-            "entries": {
-                base64.b64encode(k).decode("ascii"): base64.b64encode(v).decode("ascii")
-                for k, v in self._store.items()
-            },
-        }
-        payload = json.dumps(container, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        mac = self._container_mac(payload)
-
-        with open(path, "w") as f:
-            json.dump({
-                "container": base64.b64encode(payload).decode("ascii"),
-                "mac": base64.b64encode(mac).decode("ascii"),
-            }, f, separators=(",", ":"))
-
-    def load(self, path: str) -> None:
-        """
-        Load a store from a file.
-
-        Uses the CALLER's keys (from the constructor). Any keys present in
-        the file are ignored — keys are never read from disk. If the container
-        MAC does not verify under the caller's keys, IntegrityError is raised.
-        """
-        with open(path, "r") as f:
-            wrapper = json.load(f)
-        if "container" not in wrapper or "mac" not in wrapper:
-            raise IntegrityError("Unrecognised file format (expected v3 container)")
-
-        payload = base64.b64decode(wrapper["container"])
-        mac = base64.b64decode(wrapper["mac"])
-
-        expected = self._container_mac(payload)
-        if not hmac.compare_digest(mac, expected):
-            raise IntegrityError("Container MAC verification failed")
-
-        container = json.loads(payload.decode("utf-8"))
-
-        # Caller's keys must cover every key_id referenced in the file.
-        file_key_ids = set(int(x) for x in container.get("key_ids", []))
-        caller_key_ids = set(self._keys.keys())
-        if not file_key_ids.issubset(caller_key_ids):
-            missing = file_key_ids - caller_key_ids
-            raise UnknownKeyIdError(
-                f"File references key_ids {missing} not present in caller's keyring"
-            )
-
-        # Restore state — but do NOT touch self._keys or self._current_key_id.
-        self._counter = container["counter"]
-        self._hash_name = container["hash_name"]
-        self._ttl = container["ttl_seconds"]
-        self._clock_skew = container["clock_skew_seconds"]
-        # current_key_id must be in caller's keys
-        cur = container["current_key_id"]
-        if cur not in self._keys:
-            raise UnknownKeyIdError(f"current_key_id {cur} not in caller's keyring")
-        self._current_key_id = cur
-
-        self._max_version = {
-            base64.b64decode(k): v for k, v in container["max_version"].items()
-        }
-        self._store = {
-            base64.b64decode(k): base64.b64decode(v)
-            for k, v in container["entries"].items()
-        }
-
-    # ---------- Internals ----------
-
-    @staticmethod
-    def _hash(key: str) -> bytes:
-        return hashlib.sha3_256(key.encode("utf-8")).digest()
-
-    def _hmac(self, key_id: int, data: bytes) -> bytes:
-        if key_id not in self._keys:
-            raise UnknownKeyIdError(f"Unknown key_id: {key_id}")
-        return hmac.new(self._keys[key_id], data, self._hash_name).digest()
-
-    def _container_mac(self, payload: bytes) -> bytes:
-        """
-        Container MAC key is derived from the caller's keyring.
-
-        Derivation: HMAC(K_root, CONTAINER_DOMAIN) where K_root is the key
-        with the smallest key_id. This makes the container MAC independent of
-        rotation order and reproducible on load with the same keyring.
-        """
-        root_id = min(self._keys)
-        root_key = self._keys[root_id]
-        derived = hmac.new(root_key, CONTAINER_DOMAIN, self._hash_name).digest()
-        return hmac.new(derived, payload, self._hash_name).digest()[:CONTAINER_MAC_SIZE]
-
-    def _pack(self, key: str, value: Any, version: int, timestamp: float, nonce: bytes) -> bytes:
-        key_id = self._current_key_id
-        digest = self._hash(key)
-        header = struct.pack(HEADER_FMT, key_id, version, timestamp)
-        json_bytes = json.dumps(value).encode("utf-8")
-        payload = zlib.compress(json_bytes, level=6)
-        body = header + nonce + payload
-        mac = self._hmac(key_id, digest + body)[:HMAC_SIZE]
-        return body + mac
-
-    def _unpack(self, key: str, blob: bytes) -> Tuple[Any, Dict[str, Any]]:
-        min_size = HEADER_SIZE + NONCE_SIZE + HMAC_SIZE
-        if len(blob) < min_size:
-            raise TamperDetectedError("Record too short")
-        body = blob[:-HMAC_SIZE]
-        mac = blob[-HMAC_SIZE:]
-        key_id, version, timestamp = struct.unpack(HEADER_FMT, body[:HEADER_SIZE])
-        digest = self._hash(key)
-        expected = self._hmac(key_id, digest + body)[:HMAC_SIZE]
-        if not hmac.compare_digest(mac, expected):
-            raise TamperDetectedError("HMAC verification failed")
-        nonce = body[HEADER_SIZE:HEADER_SIZE + NONCE_SIZE]
-        payload = body[HEADER_SIZE + NONCE_SIZE:]
-        try:
-            value = json.loads(zlib.decompress(payload).decode("utf-8"))
-        except (zlib.error, json.JSONDecodeError, UnicodeDecodeError) as e:
-            raise TamperDetectedError(f"Payload decode failed: {e}")
-        return value, {"key_id": key_id, "version": version, "timestamp": timestamp, "nonce": nonce}
+if __name__ == "__main__":
+    import pytest, sys
+    sys.exit(pytest.main([__file__, "-v"]))
