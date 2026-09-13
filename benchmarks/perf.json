@@ -1,0 +1,79 @@
+==============================================================================
+PERFORMANCE BENCHMARK — exactmemory-recallspection
+==============================================================================
+Python: 3.11.2
+Scales: [100, 1000, 10000]
+
+==============================================================================
+SCALE: 100 records
+==============================================================================
+  add()   throughput:    131,669 rec/s   total: 0.001s
+          p50:     6.65 µs   p95:    11.67 µs   p99:    14.35 µs
+  get()   throughput:    203,971 rec/s   total: 0.000s
+          p50:     4.31 µs   p95:     6.45 µs   p99:    13.57 µs
+  storage  file: 27.6 KB   per record: 283 B
+
+==============================================================================
+SCALE: 1,000 records
+==============================================================================
+  add()   throughput:    142,074 rec/s   total: 0.007s
+          p50:     6.56 µs   p95:     8.53 µs   p99:    12.82 µs
+  get()   throughput:    226,788 rec/s   total: 0.004s
+          p50:     4.25 µs   p95:     4.48 µs   p99:     6.59 µs
+  storage  file: 277.2 KB   per record: 284 B
+
+==============================================================================
+SCALE: 10,000 records
+==============================================================================
+  add()   throughput:    129,584 rec/s   total: 0.077s
+          p50:     6.91 µs   p95:     9.73 µs   p99:    19.84 µs
+  get()   throughput:    195,238 rec/s   total: 0.051s
+          p50:     4.58 µs   p95:     6.86 µs   p99:    11.88 µs
+  storage  file: 2.72 MB   per record: 285 B
+
+==============================================================================
+STORAGE OVERHEAD BY PAYLOAD SIZE (100 records each)
+==============================================================================
+  Payload            |  Payload B |  Compressed B |       File B |   Per-record B |   Fixed B
+  ------------------ | ---------- | ------------- | ------------ | -------------- | ---------
+  tiny (~10 B)       |         10 |            12 |       24,841 |          248.4 |     236.4
+  small (~100 B)     |        100 |            13 |       24,841 |          248.4 |     235.4
+  medium (~1 KB)     |       1024 |            18 |       25,909 |          259.1 |     241.1
+  large (~10 KB)     |      10240 |            34 |       28,573 |          285.7 |     251.7
+
+  Interpretation:
+    - 'Compressed B' is the zlib-compressed payload.
+    - 'Fixed B' is per-record bytes that are not payload:
+        key_id (2) + version (8) + timestamp (8) + nonce (16)
+        + HMAC (16) + key digest (32) + base64 expansion.
+    - Repeated 'x' characters compress extremely well; real
+      data will show a larger 'Compressed B' and lower 'Fixed B'.
+
+==============================================================================
+WHOLE-FILE REPLAY — honest demonstration of the documented gap
+==============================================================================
+  🔴 Attacker replaced file with authentic older snapshot
+  Current value (before attack): 9999
+  Loaded value (after attack):   1000
+  Exception raised by system:    False
+  Silent stale replay:           YES (gap confirmed)
+
+  Result: whole-file replay is NOT detectable by container MAC alone.
+  The file is genuinely authentic. Detection requires an external
+  witness — a monotonic counter stored outside the file.
+
+  Mitigations:
+    - Short TTL (records expire before replay becomes useful)
+    - External counter (write count to a log server or blockchain)
+    - Cross-file chain (each save() commits to the previous save hash)
+
+==============================================================================
+SUMMARY — LATENCY AND THROUGHPUT
+==============================================================================
+    Scale |   add p50 |   add p99 |   add rec/s |   get p50 |   get p99 |   get rec/s
+  ------- | --------- | --------- | ----------- | --------- | --------- | -----------
+      100 |      6.6µ |     14.4µ |     131,669 |      4.3µ |     13.6µ |     203,971
+    1,000 |      6.6µ |     12.8µ |     142,074 |      4.2µ |      6.6µ |     226,788
+   10,000 |      6.9µ |     19.8µ |     129,584 |      4.6µ |     11.9µ |     195,238
+
+✅ Results written to: /home/24wzq8z6/benchmark_perf_results.json
