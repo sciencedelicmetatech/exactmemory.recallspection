@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "exactmemory-recallspection"
-version = "2.1.0"
-description = "Tamper-evident key-value store with HMAC-SHA256 integrity, replay resistance, key rotation, and transparency log. Zero dependencies pure Python stdlib."
+version = "3.0.0"
+description = "Tamper-evident key-value store v3.0.0 - 32-byte HMAC-SHA256, transparency log with hash chain, remote anchor, replay resistance. Zero dependencies pure Python stdlib. BREAKING: 16-byte tags no longer supported."
 readme = "README.md"
 license = { text = "AGPL-3.0" }
 authors = [{ name = "Sciencedelic Metatech", email = "eliamraell@yandex.com" }]
-keywords = ["tamper-evident", "hmac", "audit", "exact-memory", "recallspection", "cryptographic", "key-value"]
+keywords = ["tamper-evident", "hmac", "audit", "exact-memory", "recallspection", "cryptographic", "key-value", "transparency-log"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
@@ -31,6 +31,7 @@ dependencies = []
 Homepage = "https://github.com/sciencedelicmetatech/exactmemory.recallspection"
 Repository = "https://github.com/sciencedelicmetatech/exactmemory.recallspection"
 Issues = "https://github.com/sciencedelicmetatech/exactmemory.recallspection/issues"
+Changelog = "https://github.com/sciencedelicmetatech/exactmemory.recallspection/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["."]
