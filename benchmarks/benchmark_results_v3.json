@@ -1,7 +1,7 @@
 ============================================================================================================
-INTEGRITY BENCHMARK v3 — expanded attack coverage
+INTEGRITY BENCHMARK v3 — in-memory attack matrix
 ============================================================================================================
-Facts: 100  |  Attacks: 10  |  HMAC-SHA256, 16-byte tag
+Facts: 100  |  Attacks: 9  |  HMAC-SHA256, 16-byte tag
 ------------------------------------------------------------------------------------------------------------
 Attack                 |  Att | Clean |   TP |   FN |   FP |   TN |    DR |   SFR |   FPR |    SR
 ------------------------------------------------------------------------------------------------------------
@@ -12,22 +12,27 @@ truncation             |   10 |    90 |   10 |    0 |    0 |   90 |  1.00 |  0.0
 wrong_key              |  100 |     0 |  100 |    0 |    0 |    0 |  1.00 |  0.00 |  0.00 |  1.00
 replay                 |   20 |    80 |   20 |    0 |    0 |   80 |  1.00 |  0.00 |  0.00 |  1.00
 record_substitution    |    5 |    95 |    5 |    0 |    0 |   95 |  1.00 |  0.00 |  0.00 |  1.00
-deletion               |   10 |    90 |    0 |   10 |    0 |   90 |  0.00 |  1.00 |  0.00 |  0.90
+record_removal         |   10 |    90 |   10 |    0 |    0 |   90 |  1.00 |  0.00 |  0.00 |  1.00
 unknown_key_id         |   10 |    90 |   10 |    0 |    0 |   90 |  1.00 |  0.00 |  0.00 |  1.00
-expired_ttl            |    0 |   100 |    0 |    0 |  100 |    0 |   —   |   —   |  1.00 |  0.00
 ------------------------------------------------------------------------------------------------------------
 
 Legend:
-  Att    = facts the attack modified
-  Clean  = facts the attack did NOT modify
-  TP     = attacked AND detected
-  FN     = attacked AND NOT detected (silent failure)
-  FP     = clean AND falsely flagged
-  TN     = clean AND correct
   DR     = TP / Attacked        (higher better)
   SFR    = FN / Attacked        (lower better)
   FPR    = FP / Clean           (lower better)
   SR     = (TP + TN) / Total    (higher better)
+
+============================================================================================================
+FRESHNESS ENFORCEMENT (not an attack — TTL window applied)
+============================================================================================================
+  Records correctly expired after TTL: 100/100
+  Records still valid (should be 0):   0/100
+
+============================================================================================================
+TOMBSTONE DELETION (legitimate operation — tracked, not attacked)
+============================================================================================================
+  Legitimate delete (tombstone): ✅ KeyNotFoundError (tracked)
+  Direct removal (no tombstone): ✅ detected via _max_version
 
 ✅ Results written to: /home/24wzq8z6/benchmark_results_v3.json
 ​
