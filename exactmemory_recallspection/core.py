@@ -1,4 +1,4 @@
-# ExactMemory v3.0.0 - Final Release
+# ExactMemory v3.0.1 - Final Release
 # BREAKING from v2.x: 32-byte tags, explicit container_key_id, require_log, remote_anchor
 # Zero dependencies, pure Python stdlib
 
@@ -35,8 +35,10 @@ class TransparencyLog:
     def __init__(self, log_path: str, require_log: bool = True):
         self.log_path = log_path
         self.require_log = require_log
+        
     def _canonical(self, obj) -> bytes:
         return json.dumps(obj, sort_keys=True, separators=(',', ':')).encode()
+        
     def append(self, counter: int, max_version: int, container_hash: str) -> dict:
         prev_hash = "0"*64
         last = self._last_entry()
@@ -45,15 +47,32 @@ class TransparencyLog:
         entry = {'timestamp': int(time.time()), 'counter': counter, 'max_version': max_version, 'container_hash': container_hash, 'prev_hash': prev_hash}
         chain_hash = sha3_256_hex((prev_hash + self._canonical(entry).decode()).encode())
         entry['chain_hash'] = chain_hash
-        with open(self.log_path, 'a') as f:
-            if HAS_FCNTL:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            f.write(self._canonical(entry).decode() + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-            if HAS_FCNTL:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        
+        # Atomic log append
+        dir_name = os.path.dirname(os.path.abspath(self.log_path)) or "."
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name)
+        try:
+            with os.fdopen(fd, 'w') as f_tmp:
+                f_tmp.write(self._canonical(entry).decode() + "\n")
+                f_tmp.flush()
+                os.fsync(f_tmp.fileno())
+            
+            # Append to actual log safely
+            with open(self.log_path, 'a') as f:
+                if HAS_FCNTL:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                with open(tmp_path, 'r') as f_tmp_read:
+                    f.write(f_tmp_read.read())
+                f.flush()
+                os.fsync(f.fileno())
+                if HAS_FCNTL:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+                
         return entry
+
     def _last_entry(self):
         if not os.path.exists(self.log_path):
             return None
@@ -63,6 +82,7 @@ class TransparencyLog:
                 return json.loads(lines[-1]) if lines else None
         except:
             return None
+
     def verify_chain(self):
         if not os.path.exists(self.log_path):
             if self.require_log:
@@ -81,11 +101,13 @@ class TransparencyLog:
                 return False, f"Line {i} chain_hash invalid"
             prev_hash = entry['chain_hash']
         return True, f"Chain OK - {len(lines)} entries"
+
     def get_tip(self):
         return self._last_entry()
 
 class ExactMemory:
-    VERSION = "3.0.0"
+    VERSION = "3.0.1"
+    
     def __init__(self, keys: Dict[str, bytes], container_key_id: str = 'container', ttl_seconds: Optional[int]=None, log_path: str="./transparency.log", remote_anchor: Optional[RemoteAnchor]=None, require_log: bool=True, strict_rollback: bool=True):
         if container_key_id not in keys:
             raise ValueError(f"container_key_id '{container_key_id}' must exist in keys - which key signs? Explicitly required (v3.0.0 breaking change)")
@@ -105,6 +127,7 @@ class ExactMemory:
 
     def _canonical(self, record: dict) -> bytes:
         return json.dumps(record, sort_keys=True, separators=(',', ':')).encode()
+        
     def _make_tag(self, key_id: str, record: dict) -> bytes:
         rec = record.copy()
         rec['_key_hash'] = sha3_256_hex(rec['key'].encode())
@@ -151,6 +174,15 @@ class ExactMemory:
             raise TamperError(f"Key '{k}' expired")
         return None
 
+    def __len__(self) -> int:
+        """Returns the number of active (non-tombstoned, non-expired) records."""
+        return len(self.store)
+
+    def __contains__(self, k) -> bool:
+        """Checks if a key exists and is valid (not tampered/expired/tombstoned)."""
+        _, status = self.get_with_status(k)
+        return status == "ok"
+
     def delete(self, k, key_id=None):
         kid = key_id or next(iter([kk for kk in self.keys if kk != self.container_key_id]))
         self.counter += 1
@@ -169,14 +201,25 @@ class ExactMemory:
         compressed = zlib.compress(raw, 6)
         container_hash = sha3_256_hex(compressed)
         mac = hmac.new(self.keys[self.container_key_id], compressed, hashlib.sha256).digest()
-        with open(path, 'wb') as f:
-            if HAS_FCNTL:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            f.write(mac + compressed)
-            f.flush()
-            os.fsync(f.fileno())
-            if HAS_FCNTL:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        
+        # ATOMIC WRITE: Prevents corruption if process dies mid-write
+        dir_name = os.path.dirname(os.path.abspath(path)) or "."
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name)
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                if HAS_FCNTL:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                f.write(mac + compressed)
+                f.flush()
+                os.fsync(f.fileno())
+                if HAS_FCNTL:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            os.replace(tmp_path, path) # Atomic rename
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+            
         log_entry = self.log.append(self.counter, self.max_version, container_hash)
         if self.remote_anchor:
             self.remote_anchor.anchor(log_entry['chain_hash'], self.max_version, container_hash)
@@ -226,7 +269,7 @@ def make_store(log_path="./transparency.log", require_log=True):
     keys = {'k1': b'secret-key-32-bytes-long-12345678', 'k2': b'another-secret-key-32-bytes-8765', 'container': b'container-key-32-bytes-long-123456'}
     return ExactMemory(keys=keys, log_path=log_path, require_log=require_log), keys
 
-# Tests (same as v2.1.0, now v3.0.0)
+# Tests
 def test_basic_put_get():
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
