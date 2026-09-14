@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/license-AGPL--3.0-green" alt="License">
 </p>
 
-<h1 align="center">Sciencedelic Metatech</h1>
+<h1 align="center">ExactMemory-Recallspection</h1>
 
 <p align="center">
   <strong>A tamper-evident, replay-resistant, rollback-resistant key-value store with transparency log and remote anchor. Zero external dependencies.</strong>
