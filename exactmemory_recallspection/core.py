@@ -145,15 +145,15 @@ class ExactMemory:
         self.tombstones.pop(k, None)
         return record
 
-    def get_with_status(self, k) -> Tuple[Optional[object], str]:
-        if k in self.tombstones:
+    if k in self.tombstones:
             rec, tag = self.tombstones[k]
             if not hmac.compare_digest(tag, self._make_tag(rec['key_id'], rec)):
                 return None, "tampered"
             return None, "tombstoned"
         if k not in self.store:
+            if k in self.per_key_max:
+                return None, "tampered"
             return None, "missing"
-        rec, tag = self.store[k]
         if not hmac.compare_digest(tag, self._make_tag(rec['key_id'], rec)):
             return None, "tampered"
         if rec['version'] < self.per_key_max.get(k, 0):
