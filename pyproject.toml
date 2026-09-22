@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "exactmemory-recallspection"
-version = "3.0.0"
+version = "3.2.0"
 description = "Tamper-evident key-value store v3.0.0 - 32-byte HMAC-SHA256, transparency log with hash chain, remote anchor, replay resistance. Zero dependencies pure Python stdlib. BREAKING: 16-byte tags no longer supported."
 readme = "README.md"
 license = { text = "AGPL-3.0" }
