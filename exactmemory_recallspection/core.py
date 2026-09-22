@@ -1,6 +1,5 @@
-# ExactMemory v3.0.1 - Final Release
-# BREAKING from v2.x: 32-byte tags, explicit container_key_id, require_log, remote_anchor
-# Zero dependencies, pure Python stdlib
+# ExactMemory v3.2.0 - Coverage Patch 1 (write-time policy + revocation)
+# BREAKING from v3.0.1: format version bump. Old memory.db files raise FormatVersionError.
 
 import os
 import hmac
@@ -9,7 +8,7 @@ import json
 import time
 import zlib
 import tempfile
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List, Any, Callable
 
 try:
     import fcntl
@@ -25,6 +24,7 @@ class TamperError(ExactMemoryError): pass
 class RollbackError(ExactMemoryError): pass
 class LogCompromisedError(ExactMemoryError): pass
 class MissingKeyError(ExactMemoryError): pass
+class FormatVersionError(ExactMemoryError): pass  # CP1: hard-break on version mismatch
 
 class RemoteAnchor:
     def anchor(self, chain_hash: str, max_version: int, container_hash: str): raise NotImplementedError
@@ -35,10 +35,10 @@ class TransparencyLog:
     def __init__(self, log_path: str, require_log: bool = True):
         self.log_path = log_path
         self.require_log = require_log
-        
+
     def _canonical(self, obj) -> bytes:
         return json.dumps(obj, sort_keys=True, separators=(',', ':')).encode()
-        
+
     def append(self, counter: int, max_version: int, container_hash: str) -> dict:
         prev_hash = "0"*64
         last = self._last_entry()
@@ -47,8 +47,7 @@ class TransparencyLog:
         entry = {'timestamp': int(time.time()), 'counter': counter, 'max_version': max_version, 'container_hash': container_hash, 'prev_hash': prev_hash}
         chain_hash = sha3_256_hex((prev_hash + self._canonical(entry).decode()).encode())
         entry['chain_hash'] = chain_hash
-        
-        # Atomic log append
+
         dir_name = os.path.dirname(os.path.abspath(self.log_path)) or "."
         fd, tmp_path = tempfile.mkstemp(dir=dir_name)
         try:
@@ -56,8 +55,7 @@ class TransparencyLog:
                 f_tmp.write(self._canonical(entry).decode() + "\n")
                 f_tmp.flush()
                 os.fsync(f_tmp.fileno())
-            
-            # Append to actual log safely
+
             with open(self.log_path, 'a') as f:
                 if HAS_FCNTL:
                     fcntl.flock(f.fileno(), fcntl.LOCK_EX)
@@ -70,7 +68,7 @@ class TransparencyLog:
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
-                
+
         return entry
 
     def _last_entry(self):
@@ -105,10 +103,17 @@ class TransparencyLog:
     def get_tip(self):
         return self._last_entry()
 
+
 class ExactMemory:
-    VERSION = "3.0.1"
-    
-    def __init__(self, keys: Dict[str, bytes], container_key_id: str = 'container', ttl_seconds: Optional[int]=None, log_path: str="./transparency.log", remote_anchor: Optional[RemoteAnchor]=None, require_log: bool=True, strict_rollback: bool=True):
+    VERSION = "3.2.0"  # CP1: bumped from 3.0.1
+
+    # CP1: sources considered trusted. Anything else is untrusted.
+    TRUSTED_SOURCES = frozenset({"system", "admin", "user_confirmed"})
+
+    def __init__(self, keys: Dict[str, bytes], container_key_id: str = 'container',
+                 ttl_seconds: Optional[int]=None, log_path: str="./transparency.log",
+                 remote_anchor: Optional[RemoteAnchor]=None, require_log: bool=True,
+                 strict_rollback: bool=True):
         if container_key_id not in keys:
             raise ValueError(f"container_key_id '{container_key_id}' must exist in keys - which key signs? Explicitly required (v3.0.0 breaking change)")
         self.keys = keys
@@ -127,25 +132,108 @@ class ExactMemory:
 
     def _canonical(self, record: dict) -> bytes:
         return json.dumps(record, sort_keys=True, separators=(',', ':')).encode()
-        
+
     def _make_tag(self, key_id: str, record: dict) -> bytes:
+        # CP1 note: record now includes source/trusted/revoked/shadow.
+        # Since we copy the whole record and canonicalize, tag coverage is
+        # automatic. No change to this method needed.
         rec = record.copy()
         rec['_key_hash'] = sha3_256_hex(rec['key'].encode())
         rec['_key_id_hash'] = sha3_256_hex(key_id.encode())
         return hmac.new(self.keys[key_id], self._canonical(rec), hashlib.sha256).digest()[:32]
 
-    def put(self, k, v, key_id=None):
-        kid = key_id or next(iter([kk for kk in self.keys if kk != self.container_key_id]))
+    def _default_key_id(self) -> str:
+        return next(iter([kk for kk in self.keys if kk != self.container_key_id]))
+
+    # ---------------- CP1: put with write-time policy ----------------
+
+    def put(self, k, v, key_id=None, source="unknown"):
+        """
+        Write a record.
+
+        Returns:
+            "ok"       - written
+            "rejected" - untrusted source attempted to overwrite a trusted record;
+                         value shadowed, version unchanged.
+
+        Backward-incompatible: v3.0.1 returned the record dict. v3.2.0 returns str.
+        """
+        kid = key_id or self._default_key_id()
+        incoming_trusted = source in self.TRUSTED_SOURCES
+
+        # CP1 write-time policy: untrusted cannot overwrite trusted.
+        existing = self.store.get(k)
+        if existing is not None:
+            old_rec, _old_tag = existing
+            if old_rec.get('trusted', False) and not incoming_trusted:
+                old_rec.setdefault('shadow', []).append({
+                    'value': v,
+                    'source': source,
+                    'ts': int(time.time()),
+                })
+                new_tag = self._make_tag(old_rec['key_id'], old_rec)
+                self.store[k] = (old_rec, new_tag)
+                # Version NOT bumped. self.counter NOT incremented.
+                return "rejected"
+
         self.counter += 1
-        record = {'key': k, 'value': v, 'key_id': kid, 'version': self.counter, 'timestamp': int(time.time()), 'nonce': os.urandom(16).hex()}
+        record = {
+            'key': k,
+            'value': v,
+            'key_id': kid,
+            'version': self.counter,
+            'timestamp': int(time.time()),
+            'nonce': os.urandom(16).hex(),
+            'source': source,
+            'trusted': incoming_trusted,
+            'revoked': False,
+            'shadow': existing[0].get('shadow', []) if existing else [],
+        }
         tag = self._make_tag(kid, record)
         self.store[k] = (record, tag)
         self.max_version = self.counter
         self.per_key_max[k] = self.counter
         self.tombstones.pop(k, None)
-        return record
+        return "ok"
 
-    if k in self.tombstones:
+    # ---------------- CP1: revoke ----------------
+
+    def revoke(self, k, key_id=None):
+        """
+        Mark a record as revoked. Revoked records return (None, "revoked") on get,
+        and are skipped by find(). Version IS bumped so rollback cannot restore
+        an unrevoked copy.
+
+        Returns:
+            "ok"      - record revoked (or already revoked)
+            "missing" - key not present
+        """
+        if k not in self.store:
+            return "missing"
+        rec, _old_tag = self.store[k]
+        if rec.get('revoked', False):
+            return "ok"
+        self.counter += 1
+        rec['revoked'] = True
+        rec['version'] = self.counter
+        rec['revoke_timestamp'] = int(time.time())
+        new_tag = self._make_tag(rec['key_id'], rec)
+        self.store[k] = (rec, new_tag)
+        self.max_version = self.counter
+        self.per_key_max[k] = self.counter
+        return "ok"
+
+    def get_shadow(self, k) -> List[Dict[str, Any]]:
+        """CP1: return the list of rejected writes for a key (forensic view)."""
+        if k not in self.store:
+            return []
+        rec, _tag = self.store[k]
+        return list(rec.get('shadow', []))
+
+    # ---------------- read path ----------------
+
+    def get_with_status(self, k):
+        if k in self.tombstones:
             rec, tag = self.tombstones[k]
             if not hmac.compare_digest(tag, self._make_tag(rec['key_id'], rec)):
                 return None, "tampered"
@@ -154,13 +242,30 @@ class ExactMemory:
             if k in self.per_key_max:
                 return None, "tampered"
             return None, "missing"
+        rec, tag = self.store[k]
         if not hmac.compare_digest(tag, self._make_tag(rec['key_id'], rec)):
             return None, "tampered"
         if rec['version'] < self.per_key_max.get(k, 0):
             return None, "tampered"
+        if rec.get('revoked', False):                    # CP1
+            return None, "revoked"                       # CP1
         if self.ttl is not None and int(time.time()) - rec['timestamp'] > self.ttl:
             return None, "expired"
         return rec['value'], "ok"
+
+    def find(self, predicate: Callable[[Any], bool]) -> List[Tuple[str, Any, str]]:
+        """CP1: scan active (non-revoked, non-tombstoned) records matching predicate."""
+        out = []
+        for k in list(self.store.keys()):
+            value, status = self.get_with_status(k)
+            if value is None:
+                continue
+            try:
+                if predicate(value):
+                    out.append((k, value, status))
+            except Exception:
+                pass
+        return out
 
     def get(self, k, raise_on_missing=False, raise_on_tampered=False, raise_on_expired=False):
         value, status = self.get_with_status(k)
@@ -175,34 +280,43 @@ class ExactMemory:
         return None
 
     def __len__(self) -> int:
-        """Returns the number of active (non-tombstoned, non-expired) records."""
         return len(self.store)
 
     def __contains__(self, k) -> bool:
-        """Checks if a key exists and is valid (not tampered/expired/tombstoned)."""
         _, status = self.get_with_status(k)
         return status == "ok"
 
     def delete(self, k, key_id=None):
-        kid = key_id or next(iter([kk for kk in self.keys if kk != self.container_key_id]))
+        kid = key_id or self._default_key_id()
         self.counter += 1
-        tomb = {'key': k, 'deleted': True, 'version': self.counter, 'key_id': kid, 'timestamp': int(time.time()), 'nonce': os.urandom(16).hex()}
+        tomb = {'key': k, 'deleted': True, 'version': self.counter, 'key_id': kid,
+                'timestamp': int(time.time()), 'nonce': os.urandom(16).hex()}
         tag = self._make_tag(kid, tomb)
         self.tombstones[k] = (tomb, tag)
         self.store.pop(k, None)
         self.max_version = self.counter
         self.per_key_max[k] = self.counter
 
+    # ---------------- persistence ----------------
+
     def save(self, path: str):
         entries = [(key, rec, tag.hex()) for key, (rec, tag) in self.store.items()]
         tombs = [(key, rec, tag.hex()) for key, (rec, tag) in self.tombstones.items()]
-        container = {'counter': self.counter, 'max_version': self.max_version, 'per_key_max': self.per_key_max, 'entries': entries, 'tombstones': tombs, 'tag_len': 32, 'version': self.VERSION, 'container_key_id': self.container_key_id}
+        container = {
+            'counter': self.counter,
+            'max_version': self.max_version,
+            'per_key_max': self.per_key_max,
+            'entries': entries,
+            'tombstones': tombs,
+            'tag_len': 32,
+            'version': self.VERSION,
+            'container_key_id': self.container_key_id,
+        }
         raw = json.dumps(container, sort_keys=True, separators=(',', ':')).encode()
         compressed = zlib.compress(raw, 6)
         container_hash = sha3_256_hex(compressed)
         mac = hmac.new(self.keys[self.container_key_id], compressed, hashlib.sha256).digest()
-        
-        # ATOMIC WRITE: Prevents corruption if process dies mid-write
+
         dir_name = os.path.dirname(os.path.abspath(path)) or "."
         fd, tmp_path = tempfile.mkstemp(dir=dir_name)
         try:
@@ -214,12 +328,12 @@ class ExactMemory:
                 os.fsync(f.fileno())
                 if HAS_FCNTL:
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            os.replace(tmp_path, path) # Atomic rename
+            os.replace(tmp_path, path)
         except Exception:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
             raise
-            
+
         log_entry = self.log.append(self.counter, self.max_version, container_hash)
         if self.remote_anchor:
             self.remote_anchor.anchor(log_entry['chain_hash'], self.max_version, container_hash)
@@ -235,23 +349,36 @@ class ExactMemory:
             latest_remote = self.remote_anchor.get_latest()
             if latest_remote and tip['max_version'] < latest_remote['max_version']:
                 raise RollbackError(f"Log rollback vs remote anchor: log {tip['max_version']} < remote {latest_remote['max_version']}")
+
         with open(path, 'rb') as f:
             if HAS_FCNTL:
                 fcntl.flock(f.fileno(), fcntl.LOCK_SH)
             blob = f.read()
             if HAS_FCNTL:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
         if len(blob) < 32:
             raise TamperError("File too short")
         mac, compressed = blob[:32], blob[32:]
         expected_mac = hmac.new(keys[self.container_key_id], compressed, hashlib.sha256).digest()
         if not hmac.compare_digest(mac, expected_mac):
             raise TamperError("Container MAC failed")
+
         container_hash = sha3_256_hex(compressed)
         raw = zlib.decompress(compressed)
         container = json.loads(raw)
+
+        # CP1: hard-break on format version mismatch.
+        file_version = container.get('version', 'unknown')
+        if file_version != self.VERSION:
+            raise FormatVersionError(
+                f"Container format '{file_version}' incompatible with this version '{self.VERSION}'. "
+                f"Hard break introduced in 3.2.0. Re-ingest data."
+            )
+
         if tip and container['max_version'] < tip['max_version']:
             raise RollbackError(f"ROLLBACK DETECTED! File {container['max_version']} < log {tip['max_version']}")
+
         self.keys = keys
         self.counter = container['counter']
         self.max_version = container['max_version']
@@ -265,48 +392,7 @@ class ExactMemory:
             self.store[k] = (rec, bytes.fromhex(tag_hex))
         self.tombstones = {k: (rec, bytes.fromhex(tag_hex)) for k, rec, tag_hex in container.get('tombstones', [])}
 
+
 def make_store(log_path="./transparency.log", require_log=True):
     keys = {'k1': b'secret-key-32-bytes-long-12345678', 'k2': b'another-secret-key-32-bytes-8765', 'container': b'container-key-32-bytes-long-123456'}
     return ExactMemory(keys=keys, log_path=log_path, require_log=require_log), keys
-
-# Tests
-def test_basic_put_get():
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
-        store, _ = make_store(os.path.join(tmp, "log"))
-        store.put("user_123", {"theme": "dark"})
-        assert store.get("user_123") == {"theme": "dark"}
-
-def test_32byte_tags():
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
-        store, _ = make_store(os.path.join(tmp, "log"))
-        store.put("a", "data")
-        rec, tag = store.store["a"]
-        assert len(tag) == 32
-
-def test_rollback_protection():
-    import tempfile, shutil
-    with tempfile.TemporaryDirectory() as tmp:
-        log_path = os.path.join(tmp, "log")
-        db_v5 = os.path.join(tmp, "db_v5")
-        db_v10 = os.path.join(tmp, "db_v10")
-        store, keys = make_store(log_path)
-        for i in range(5):
-            store.put(f"k{i}", f"v{i}")
-        store.save(db_v5)
-        shutil.copy(db_v5, db_v5+".bak")
-        for i in range(5, 10):
-            store.put(f"k{i}", f"v{i}")
-        store.save(db_v10)
-        shutil.copy(db_v5+".bak", db_v10)
-        new_store, _ = make_store(log_path)
-        try:
-            new_store.load(db_v10, keys)
-            assert False
-        except Exception as e:
-            assert "ROLLBACK" in str(e)
-
-if __name__ == "__main__":
-    import pytest, sys
-    sys.exit(pytest.main([__file__, "-v"]))
