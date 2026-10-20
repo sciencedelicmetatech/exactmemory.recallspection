@@ -12,7 +12,7 @@
   Part of the <a href="https://github.com/sciencedelicmetatech/recallspection">Recallspection</a> project · Powered by Sciencedelic Metatech.
 </p>
 
-> **Architecture:** [Synthetic Intelligence Requires Exact Memory](https://doi.org/10.5281/zenodo.XXXXXXX) (Insert new DOI here)  
+> **Architecture:** [Synthetic Intelligence Requires Exact Memory](https://https://doi.org/10.5281/zenodo.23378369)
 > **AGMI Status:** Officially certified **Level L4** (9/9 attacks rejected)  
 > **Normative Spec:** [RPRS-1](https://github.com/sciencedelicmetatech/recallspection/blob/main/spec/rprs-1.tex)
 
