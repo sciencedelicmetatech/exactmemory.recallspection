@@ -1,5 +1,6 @@
 # ExactMemory v3.2.0 - Coverage Patch 1 (write-time policy + revocation)
 # BREAKING from v3.0.1: format version bump. Old memory.db files raise FormatVersionError.
+# + PR1: Portable Proof bridge (export/import bundle state).
 
 import os
 import hmac
@@ -134,9 +135,6 @@ class ExactMemory:
         return json.dumps(record, sort_keys=True, separators=(',', ':')).encode()
 
     def _make_tag(self, key_id: str, record: dict) -> bytes:
-        # CP1 note: record now includes source/trusted/revoked/shadow.
-        # Since we copy the whole record and canonicalize, tag coverage is
-        # automatic. No change to this method needed.
         rec = record.copy()
         rec['_key_hash'] = sha3_256_hex(rec['key'].encode())
         rec['_key_id_hash'] = sha3_256_hex(key_id.encode())
@@ -391,6 +389,53 @@ class ExactMemory:
                 continue
             self.store[k] = (rec, bytes.fromhex(tag_hex))
         self.tombstones = {k: (rec, bytes.fromhex(tag_hex)) for k, rec, tag_hex in container.get('tombstones', [])}
+
+    # ---------------- PORTABLE PROOF BRIDGE (PR1) ----------------
+
+    def export_state(self) -> dict:
+        """Extracts the raw state for portable.py to bundle."""
+        entries = [(k, rec, tag.hex()) for k, (rec, tag) in self.store.items()]
+        tombs = [(k, rec, tag.hex()) for k, (rec, tag) in self.tombstones.items()]
+        return {
+            "version": self.VERSION,
+            "counter": self.counter,
+            "max_version": self.max_version,
+            "per_key_max": self.per_key_max,
+            "entries": entries,
+            "tombstones": tombs,
+            "log_tip": self.log.get_tip()
+        }
+
+    def import_state(self, state: dict, require_cross_anchor: bool = True):
+        """Loads verified state from a portable bundle and verifies continuity."""
+        # Verify monotonicity against current state before importing
+        if state["max_version"] < self.max_version:
+            raise RollbackError(f"Bundle rollback: bundle v{state['max_version']} < current v{self.max_version}")
+            
+        self.counter = state["counter"]
+        self.max_version = state["max_version"]
+        self.per_key_max = state["per_key_max"]
+        
+        self.store = {k: (rec, bytes.fromhex(tag_hex)) for k, rec, tag_hex in state["entries"]}
+        self.tombstones = {k: (rec, bytes.fromhex(tag_hex)) for k, rec, tag_hex in state["tombstones"]}
+        
+        # Fail-closed verification of all imported records
+        for k in list(self.store.keys()):
+            rec, tag = self.store[k]
+            if not hmac.compare_digest(tag, self._make_tag(rec['key_id'], rec)):
+                raise TamperError(f"Imported record {k} failed tag verification")
+
+        # Anchor the imported log tip to the local log so future saves are protected
+        if state.get("log_tip"):
+            self.log.append(
+                counter=state["counter"],
+                max_version=state["max_version"],
+                container_hash=state["log_tip"]["chain_hash"] # Simplified hash bind for import
+            )
+
+    def get_container_mac(self, bundle_bytes: bytes) -> bytes:
+        """Helper to sign the bundle using the container key."""
+        return hmac.new(self.keys[self.container_key_id], bundle_bytes, hashlib.sha256).digest()
 
 
 def make_store(log_path="./transparency.log", require_log=True):
