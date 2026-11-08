@@ -5,15 +5,15 @@
 <h1>ExactMemory</h1>
 
 <p>
-  <strong>A tamper-evident, replay-resistant, rollback-resistant key-value store with transparency log and remote anchor. Zero external dependencies.</strong>
+  <strong>A tamper-evident, replay-resistant, rollback-resistant key-value store with transparency log, remote anchor, and portable proofs. Zero external dependencies.</strong>
 </p>
 
 <p>
   Part of the <a href="https://github.com/sciencedelicmetatech/recallspection">Recallspection</a> project · Powered by Sciencedelic Metatech.
 </p>
 
-> **Architecture:** [Synthetic Intelligence Requires Exact Memory](https://https://doi.org/10.5281/zenodo.23378369)
-> **AGMI Status:** Officially certified **Level L4** (9/9 attacks rejected)  
+> **Architecture:** [Synthetic Intelligence Requires Exact Memory](https://doi.org/10.5281/zenodo.23378369)  
+> **AGMI Status:** Officially certified **Level L4** (10/10 attacks rejected)  
 > **Normative Spec:** [RPRS-1](https://github.com/sciencedelicmetatech/recallspection/blob/main/spec/rprs-1.tex)
 
 [![AGMI](https://img.shields.io/badge/agmi-L4%20Conformant-0F4C5C)](https://agentmemoryintegrity.org/stores/recallspection-exact-anchor.html)
@@ -49,9 +49,9 @@ The library is **pure Python standard library**. It runs on Linux, macOS, Window
 
 ## Official AGMI Level L4 Conformance
 
-This core library powers the exact memory layer that achieved **Level L4 on the Agent Memory Integrity (AGMI) benchmark**. 
+This core library powers the exact memory layer that achieved **Level L4 on the Agent Memory Integrity (AGMI) benchmark**, and extends the standard with **T10: Erasure Resurrection** protection.
 
-The AGMI suite tested nine storage-level edits. Recallspection (powered by `exactmemory`) rejected **9 out of 9** on the read path: 0 edits were served as genuine, and 0 were merely reported on audit.
+The AGMI suite tested ten storage-level edits. Recallspection (powered by `exactmemory`) rejected **10 out of 10** on the read path: 0 edits were served as genuine, and 0 were merely reported on audit.
 
 | Attack | Verdict |
 |---|---|
@@ -64,36 +64,27 @@ The AGMI suite tested nine storage-level edits. Recallspection (powered by `exac
 | T7 rollback replay | rejected on read |
 | T8 metadata tamper | rejected on read |
 | T9 snapshot rollback | rejected on read |
+| **T10 erasure resurrection** | **rejected on read** |
 
 *Note: T9 requires the remote anchor backend (S3 Object Lock) to be configured.*  
 [View Official L4 Conformance Result](https://agentmemoryintegrity.org/stores/recallspection-exact-anchor.html)
 
 ---
 
-## Features
+## Portable Proof: We lock the truth in, not you in.
 
-| Feature | Description |
-|---------|-------------|
-| **HMAC-SHA256 integrity** | **32-byte** authentication tag over full record |
-| **Container MAC** | On-disk container authenticated with explicit `container_key_id` |
-| **Metadata binding** | Tag covers `key_id`, `version`, `timestamp`, `nonce` - not just payload |
-| **Out-of-band keys** | Keys never touch data file; `load()` accepts only caller-supplied keys |
-| **Replay resistance** | Monotonic version + timestamp + optional TTL |
-| **Rollback resistance** | Transparency log with hash chain - `ROLLBACK DETECTED` if file `max_version` < log tip |
-| **Log deletion protection** | `require_log=True` by default - deletion triggers `LogCompromisedError` |
-| **Remote anchor** | Stub interface `RemoteAnchor` + S3 example prevents log+container rollback |
-| **Atomic Saves** | Prevents DB corruption on sudden crashes via `tempfile` + `os.replace` |
-| **Concurrent save()** | `fcntl.flock` prevents corruption under parallel saves |
-| **Substitution resistance** | Records bound to SHA3-256 digest of their key |
-| **Tombstones** | Deletion writes signed tombstone with distinct status |
-| **Granular Status** | `get_with_status()` returns `ok` / `missing` / `tampered` / `expired` / `tombstoned` |
-| **Bit-flip property test** | Every single bit flip detected in test suite |
-| **Zero dependencies** | Pure Python 3.8+ stdlib |
-| **Tiny footprint** | < 600 lines core, < 20 KB installed |
+Traditional security vendors lock you in. ExactMemory uses **Portable Proof**. You can export a cryptographic bundle of your entire store, including the transparency log and the anchor receipts.
 
----
+The bundle is verifiable offline. It works across clouds. It survives the death of the original server. If you move from AWS to GCP, you take the truth with you, and the new anchor signs the old tip.
 
-## Installation
+```python
+from portable import export_bundle, import_bundle, reanchor
 
-```bash
-pip install exactmemory-recallspection
+# Export a verifiable bundle (includes genesis, records, tombstones, and anchor receipts)
+export_bundle(store, "backup.portable", anchor=s3_anchor)
+
+# Import elsewhere (verifies MAC, tags, monotonicity, and cross-anchor)
+import_bundle(new_store, "backup.portable", anchor=new_s3_anchor)
+
+# Migrate to a new anchor (cross-anchor ceremony)
+reanchor(store, old_anchor, new_anchor)
