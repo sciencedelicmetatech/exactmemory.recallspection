@@ -22,6 +22,7 @@
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)]()
 [![Tags](https://img.shields.io/badge/tags-32--byte%20HMAC--SHA256-blue)]()
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green)]()
+[![agmi: measured](https://img.shields.io/badge/agmi-measured-0F4C5C)](https://agentmemoryintegrity.org/stores/recallspection-exact-anchor.html)
 </div>
 
 ---
