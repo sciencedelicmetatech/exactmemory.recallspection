@@ -14,10 +14,10 @@
 
 > **Architecture:** [Synthetic Intelligence Requires Exact Memory](https://doi.org/10.5281/zenodo.23378369)  
 > **AGMI Status:** Officially certified **Level L4** (10/10 attacks rejected)  
-> **Normative Spec:** [RPRS-1](https://github.com/sciencedelicmetatech/recallspection/blob/main/spec/rprs-1.tex)
+> **Normative Spec:** [RPRS-1 v2.0.0](https://github.com/sciencedelicmetatech/recallspection/blob/main/spec/rprs-1.tex)
 
 [![AGMI](https://img.shields.io/badge/agmi-L4%20Conformant-0F4C5C)](https://agentmemoryintegrity.org/stores/recallspection-exact-anchor.html)
-[![Version](https://img.shields.io/badge/version-3.2.0-blue)]()
+[![Version](https://img.shields.io/badge/version-3.3.0-blue)]()
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)]()
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)]()
 [![Tags](https://img.shields.io/badge/tags-32--byte%20HMAC--SHA256-blue)]()
@@ -69,22 +69,10 @@ The AGMI suite tested ten storage-level edits. Recallspection (powered by `exact
 *Note: T9 requires the remote anchor backend (S3 Object Lock) to be configured.*  
 [View Official L4 Conformance Result](https://agentmemoryintegrity.org/stores/recallspection-exact-anchor.html)
 
----
+### 🧪 Run the AGMI Toggle Measure Yourself
 
-## Portable Proof: We lock the truth in, not you in.
+You do not have to take our word for it. You can run the exact same conformance measurement locally to prove the 10/10 rejection rate:
 
-Traditional security vendors lock you in. ExactMemory uses **Portable Proof**. You can export a cryptographic bundle of your entire store, including the transparency log and the anchor receipts.
-
-The bundle is verifiable offline. It works across clouds. It survives the death of the original server. If you move from AWS to GCP, you take the truth with you, and the new anchor signs the old tip.
-
-```python
-from portable import export_bundle, import_bundle, reanchor
-
-# Export a verifiable bundle (includes genesis, records, tombstones, and anchor receipts)
-export_bundle(store, "backup.portable", anchor=s3_anchor)
-
-# Import elsewhere (verifies MAC, tags, monotonicity, and cross-anchor)
-import_bundle(new_store, "backup.portable", anchor=new_s3_anchor)
-
-# Migrate to a new anchor (cross-anchor ceremony)
-reanchor(store, old_anchor, new_anchor)
+```bash
+# Run the official AGMI self-check against your local ExactMemory instance
+python -m exactmemory_recallspection.conformance.agmi_selfcheck
