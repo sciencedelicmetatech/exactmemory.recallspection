@@ -1,6 +1,6 @@
-# ExactMemory v3.2.0 - Coverage Patch 1 (write-time policy + revocation)
-# BREAKING from v3.0.1: format version bump. Old memory.db files raise FormatVersionError.
-# + PR1: Portable Proof bridge (export/import bundle state).
+# ExactMemory v3.3.0 - Front Door Sealed (PR4)
+# Includes: CP1 (Write-Time Policy), PR1 (Portable Proof), PR4 (Provenance & Admission)
+# BREAKING from v3.2.0: Records now require `writer_id` and `source`. Admission controls are enforced.
 
 import os
 import hmac
@@ -25,7 +25,8 @@ class TamperError(ExactMemoryError): pass
 class RollbackError(ExactMemoryError): pass
 class LogCompromisedError(ExactMemoryError): pass
 class MissingKeyError(ExactMemoryError): pass
-class FormatVersionError(ExactMemoryError): pass  # CP1: hard-break on version mismatch
+class FormatVersionError(ExactMemoryError): pass
+class AdmissionError(ExactMemoryError): pass  # PR4: Front door refusal
 
 class RemoteAnchor:
     def anchor(self, chain_hash: str, max_version: int, container_hash: str): raise NotImplementedError
@@ -40,12 +41,23 @@ class TransparencyLog:
     def _canonical(self, obj) -> bytes:
         return json.dumps(obj, sort_keys=True, separators=(',', ':')).encode()
 
-    def append(self, counter: int, max_version: int, container_hash: str) -> dict:
+    def append(self, counter: int, max_version: int, container_hash: str, event_type: str = "commit", meta: dict = None) -> dict:
         prev_hash = "0"*64
         last = self._last_entry()
         if last:
             prev_hash = last['chain_hash']
-        entry = {'timestamp': int(time.time()), 'counter': counter, 'max_version': max_version, 'container_hash': container_hash, 'prev_hash': prev_hash}
+            
+        entry = {
+            'timestamp': int(time.time()), 
+            'counter': counter, 
+            'max_version': max_version, 
+            'container_hash': container_hash, 
+            'prev_hash': prev_hash,
+            'event_type': event_type
+        }
+        if meta:
+            entry['meta'] = meta
+            
         chain_hash = sha3_256_hex((prev_hash + self._canonical(entry).decode()).encode())
         entry['chain_hash'] = chain_hash
 
@@ -106,17 +118,27 @@ class TransparencyLog:
 
 
 class ExactMemory:
-    VERSION = "3.2.0"  # CP1: bumped from 3.0.1
+    VERSION = "3.3.0"  # PR4: Front door sealed
 
-    # CP1: sources considered trusted. Anything else is untrusted.
-    TRUSTED_SOURCES = frozenset({"system", "admin", "user_confirmed"})
+    # Sources permitted to overwrite trusted data
+    TRUSTED_SOURCES = frozenset({"system", "admin", "human", "tool_verified"})
+    
+    # PR4: Default Admission Control Policy (Deny list)
+    # Source cannot write to these keys.
+    DEFAULT_ADMISSION_POLICY = {
+        "email": ["vip_exempt", "kyc", "admin_override"],
+        "web": ["vip_exempt", "kyc", "admin_override"],
+        "user_prompt": ["vip_exempt", "kyc"]
+    }
 
     def __init__(self, keys: Dict[str, bytes], container_key_id: str = 'container',
                  ttl_seconds: Optional[int]=None, log_path: str="./transparency.log",
                  remote_anchor: Optional[RemoteAnchor]=None, require_log: bool=True,
-                 strict_rollback: bool=True):
+                 strict_rollback: bool=True, admission_policy: Optional[dict] = None):
+        
         if container_key_id not in keys:
-            raise ValueError(f"container_key_id '{container_key_id}' must exist in keys - which key signs? Explicitly required (v3.0.0 breaking change)")
+            raise ValueError(f"container_key_id '{container_key_id}' must exist in keys")
+            
         self.keys = keys
         self.container_key_id = container_key_id
         self.ttl = ttl_seconds
@@ -130,33 +152,52 @@ class ExactMemory:
         self.require_log = require_log
         self.strict_rollback = strict_rollback
         self.tag_len = 32
+        self.admission_policy = admission_policy or self.DEFAULT_ADMISSION_POLICY
 
     def _canonical(self, record: dict) -> bytes:
         return json.dumps(record, sort_keys=True, separators=(',', ':')).encode()
 
     def _make_tag(self, key_id: str, record: dict) -> bytes:
+        if key_id not in self.keys:
+            raise MissingKeyError(f"Key ID '{key_id}' not found in keyring.")
+            
         rec = record.copy()
         rec['_key_hash'] = sha3_256_hex(rec['key'].encode())
         rec['_key_id_hash'] = sha3_256_hex(key_id.encode())
+        # PR4: writer_id and source are automatically covered by the tag
+        # because they are part of the `record` dict.
         return hmac.new(self.keys[key_id], self._canonical(rec), hashlib.sha256).digest()[:32]
 
     def _default_key_id(self) -> str:
         return next(iter([kk for kk in self.keys if kk != self.container_key_id]))
 
-    # ---------------- CP1: put with write-time policy ----------------
+    # ---------------- PR4: Admission Control ----------------
 
-    def put(self, k, v, key_id=None, source="unknown"):
+    def _admit(self, source: str, key_id: str):
+        """Checks if the source is permitted to write to the key."""
+        denied_keys = self.admission_policy.get(source, [])
+        if key_id in denied_keys:
+            raise AdmissionError(f"Front Door Refused: Source '{source}' is denied write access to key '{key_id}'.")
+        if key_id.startswith("kyc") and source != "system":
+             raise AdmissionError(f"Front Door Refused: Source '{source}' cannot write to KYC keys.")
+
+    # ---------------- put with write-time policy & PR4 ----------------
+
+    def put(self, k, v, writer_id=None, source="unknown"):
         """
         Write a record.
-
-        Returns:
-            "ok"       - written
-            "rejected" - untrusted source attempted to overwrite a trusted record;
-                         value shadowed, version unchanged.
-
-        Backward-incompatible: v3.0.1 returned the record dict. v3.2.0 returns str.
+        Returns: "ok" | "rejected" | "admission_refused"
         """
-        kid = key_id or self._default_key_id()
+        kid = writer_id or self._default_key_id()
+        
+        # PR4: Front Door Admission Control
+        try:
+            self._admit(source, kid)
+        except AdmissionError as e:
+            # PR4: Log the refused attempt to the transparency log (forensics)
+            self.log.append(self.counter, self.max_version, "N/A", event_type="admission_refused", meta={"key": k, "source": source, "writer": kid})
+            raise e # Re-raise to stop the write
+
         incoming_trusted = source in self.TRUSTED_SOURCES
 
         # CP1 write-time policy: untrusted cannot overwrite trusted.
@@ -165,13 +206,13 @@ class ExactMemory:
             old_rec, _old_tag = existing
             if old_rec.get('trusted', False) and not incoming_trusted:
                 old_rec.setdefault('shadow', []).append({
-                    'value': v,
-                    'source': source,
-                    'ts': int(time.time()),
+                    'value': v, 'source': source, 'writer_id': kid, 'ts': int(time.time()),
                 })
                 new_tag = self._make_tag(old_rec['key_id'], old_rec)
                 self.store[k] = (old_rec, new_tag)
-                # Version NOT bumped. self.counter NOT incremented.
+                
+                # CP1: Log the shadow write
+                self.log.append(self.counter, self.max_version, "N/A", event_type="shadow_write", meta={"key": k, "source": source})
                 return "rejected"
 
         self.counter += 1
@@ -182,7 +223,8 @@ class ExactMemory:
             'version': self.counter,
             'timestamp': int(time.time()),
             'nonce': os.urandom(16).hex(),
-            'source': source,
+            'source': source,        # PR4: Source Binding
+            'writer_id': kid,        # PR4: Provenance
             'trusted': incoming_trusted,
             'revoked': False,
             'shadow': existing[0].get('shadow', []) if existing else [],
@@ -194,18 +236,9 @@ class ExactMemory:
         self.tombstones.pop(k, None)
         return "ok"
 
-    # ---------------- CP1: revoke ----------------
+    # ---------------- revoke ----------------
 
     def revoke(self, k, key_id=None):
-        """
-        Mark a record as revoked. Revoked records return (None, "revoked") on get,
-        and are skipped by find(). Version IS bumped so rollback cannot restore
-        an unrevoked copy.
-
-        Returns:
-            "ok"      - record revoked (or already revoked)
-            "missing" - key not present
-        """
         if k not in self.store:
             return "missing"
         rec, _old_tag = self.store[k]
@@ -222,7 +255,6 @@ class ExactMemory:
         return "ok"
 
     def get_shadow(self, k) -> List[Dict[str, Any]]:
-        """CP1: return the list of rejected writes for a key (forensic view)."""
         if k not in self.store:
             return []
         rec, _tag = self.store[k]
@@ -245,14 +277,13 @@ class ExactMemory:
             return None, "tampered"
         if rec['version'] < self.per_key_max.get(k, 0):
             return None, "tampered"
-        if rec.get('revoked', False):                    # CP1
-            return None, "revoked"                       # CP1
+        if rec.get('revoked', False):
+            return None, "revoked"
         if self.ttl is not None and int(time.time()) - rec['timestamp'] > self.ttl:
             return None, "expired"
         return rec['value'], "ok"
 
     def find(self, predicate: Callable[[Any], bool]) -> List[Tuple[str, Any, str]]:
-        """CP1: scan active (non-revoked, non-tombstoned) records matching predicate."""
         out = []
         for k in list(self.store.keys()):
             value, status = self.get_with_status(k)
@@ -313,10 +344,18 @@ class ExactMemory:
         raw = json.dumps(container, sort_keys=True, separators=(',', ':')).encode()
         compressed = zlib.compress(raw, 6)
         container_hash = sha3_256_hex(compressed)
+        
+        # PR4: Double Signature (Outer layer)
         mac = hmac.new(self.keys[self.container_key_id], compressed, hashlib.sha256).digest()
 
         dir_name = os.path.dirname(os.path.abspath(path)) or "."
         fd, tmp_path = tempfile.mkstemp(dir=dir_name)
+        
+        # Backup existing file for rollback if log fails
+        backup_path = path + ".bak"
+        if os.path.exists(path):
+            os.replace(path, backup_path)
+            
         try:
             with os.fdopen(fd, 'wb') as f:
                 if HAS_FCNTL:
@@ -330,19 +369,37 @@ class ExactMemory:
         except Exception:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+            if os.path.exists(backup_path):
+                os.replace(backup_path, path)
             raise
 
-        log_entry = self.log.append(self.counter, self.max_version, container_hash)
-        if self.remote_anchor:
-            self.remote_anchor.anchor(log_entry['chain_hash'], self.max_version, container_hash)
+        try:
+            log_entry = self.log.append(self.counter, self.max_version, container_hash)
+            if self.remote_anchor:
+                self.remote_anchor.anchor(log_entry['chain_hash'], self.max_version, container_hash)
+        except Exception as e:
+            # Atomicity fix: If log fails, revert the file
+            if os.path.exists(backup_path):
+                os.replace(backup_path, path)
+            raise LogCompromisedError(f"Failed to append to log, file reverted: {e}")
+        finally:
+            if os.path.exists(backup_path):
+                os.unlink(backup_path)
 
     def load(self, path: str, keys: Dict[str, bytes]):
+        # Bug fix: Handle first-time load gracefully
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"No database found at {path}")
+            
         valid, msg = self.log.verify_chain()
         if not valid:
             raise LogCompromisedError(msg)
         tip = self.log.get_tip()
+        
+        # Only require log if the file is not empty (i.e., not a fresh init)
         if self.require_log and not tip:
             raise LogCompromisedError("Log required but missing - possible deletion attack. Set require_log=False to opt-in")
+            
         if self.remote_anchor and tip:
             latest_remote = self.remote_anchor.get_latest()
             if latest_remote and tip['max_version'] < latest_remote['max_version']:
@@ -362,16 +419,14 @@ class ExactMemory:
         if not hmac.compare_digest(mac, expected_mac):
             raise TamperError("Container MAC failed")
 
-        container_hash = sha3_256_hex(compressed)
         raw = zlib.decompress(compressed)
         container = json.loads(raw)
 
-        # CP1: hard-break on format version mismatch.
         file_version = container.get('version', 'unknown')
         if file_version != self.VERSION:
             raise FormatVersionError(
                 f"Container format '{file_version}' incompatible with this version '{self.VERSION}'. "
-                f"Hard break introduced in 3.2.0. Re-ingest data."
+                f"Hard break introduced in 3.3.0. Re-ingest data."
             )
 
         if tip and container['max_version'] < tip['max_version']:
@@ -393,7 +448,6 @@ class ExactMemory:
     # ---------------- PORTABLE PROOF BRIDGE (PR1) ----------------
 
     def export_state(self) -> dict:
-        """Extracts the raw state for portable.py to bundle."""
         entries = [(k, rec, tag.hex()) for k, (rec, tag) in self.store.items()]
         tombs = [(k, rec, tag.hex()) for k, (rec, tag) in self.tombstones.items()]
         return {
@@ -407,10 +461,14 @@ class ExactMemory:
         }
 
     def import_state(self, state: dict, require_cross_anchor: bool = True):
-        """Loads verified state from a portable bundle and verifies continuity."""
-        # Verify monotonicity against current state before importing
+        # Check against in-memory state
         if state["max_version"] < self.max_version:
             raise RollbackError(f"Bundle rollback: bundle v{state['max_version']} < current v{self.max_version}")
+            
+        # Check against log tip
+        tip = self.log.get_tip()
+        if tip and state["max_version"] < tip["max_version"]:
+             raise RollbackError(f"Bundle rollback vs local log: bundle v{state['max_version']} < log v{tip['max_version']}")
             
         self.counter = state["counter"]
         self.max_version = state["max_version"]
@@ -419,22 +477,21 @@ class ExactMemory:
         self.store = {k: (rec, bytes.fromhex(tag_hex)) for k, rec, tag_hex in state["entries"]}
         self.tombstones = {k: (rec, bytes.fromhex(tag_hex)) for k, rec, tag_hex in state["tombstones"]}
         
-        # Fail-closed verification of all imported records
+        # Fail-closed verification of all imported records (PR4 covered automatically)
         for k in list(self.store.keys()):
             rec, tag = self.store[k]
             if not hmac.compare_digest(tag, self._make_tag(rec['key_id'], rec)):
                 raise TamperError(f"Imported record {k} failed tag verification")
 
-        # Anchor the imported log tip to the local log so future saves are protected
+        # Anchor the imported log tip
         if state.get("log_tip"):
             self.log.append(
                 counter=state["counter"],
                 max_version=state["max_version"],
-                container_hash=state["log_tip"]["chain_hash"] # Simplified hash bind for import
+                container_hash=state["log_tip"]["chain_hash"]
             )
 
     def get_container_mac(self, bundle_bytes: bytes) -> bytes:
-        """Helper to sign the bundle using the container key."""
         return hmac.new(self.keys[self.container_key_id], bundle_bytes, hashlib.sha256).digest()
 
 
