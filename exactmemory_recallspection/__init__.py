@@ -5,12 +5,13 @@ from .core import (
     RollbackError,
     LogCompromisedError,
     MissingKeyError,
-    FormatVersionError,          # <-- add
+    FormatVersionError,
+    AdmissionError,  # <-- Added for PR4
     TransparencyLog,
     RemoteAnchor,
 )
-...
-__version__ = "3.2.0"            # <-- bump
+
+__version__ = "3.3.0"  # <-- Bumped
 
 __all__ = [
     "ExactMemory",
@@ -19,7 +20,8 @@ __all__ = [
     "RollbackError",
     "LogCompromisedError",
     "MissingKeyError",
-    "FormatVersionError",        # <-- add
+    "FormatVersionError",
+    "AdmissionError",  # <-- Added
     "TransparencyLog",
     "RemoteAnchor",
     # v1 compat aliases (unchanged)
